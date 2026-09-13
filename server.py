@@ -457,17 +457,19 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("X-Panel-Key") == PANEL_KEY
 
     # ---------- 响应工具 ----------
-    def _send(self, code: int, body: bytes, ctype: str):
+    def _send(self, code: int, body: bytes, ctype: str, cache_control: str | None = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        if cache_control is None:
+            cache_control = "no-store, no-cache, must-revalidate"
+        self.send_header("Cache-Control", cache_control)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-XSS-Protection", "1; mode=block")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Content-Security-Policy", _CSP_POLICY)
-        if self.headers.get("X-Forwarded-Proto") == "https" or self.server.is_ssl:
+        if self.headers.get("X-Forwarded-Proto") == "https" or getattr(self.server, "is_ssl", False):
             self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         self.end_headers()
         self.wfile.write(body)
@@ -508,12 +510,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     # ---------- 静态文件 ----------
+    _STATIC_CACHE = {
+        ".js": "public, max-age=31536000, immutable",
+        ".css": "public, max-age=31536000, immutable",
+        ".svg": "public, max-age=86400",
+        ".png": "public, max-age=86400",
+        ".ico": "public, max-age=86400",
+    }
+    _NO_CACHE = "no-store, no-cache, must-revalidate"
+
     def _static(self, path: str):
+        from urllib.parse import urlparse
+
+        path = urlparse(path).path
         if path in ("/", ""):
             path = "/index.html"
         try:
             file = (PUBLIC_DIR / path.lstrip("/")).resolve()
-            # 用 relative_to 做包含校验，防 ../ 与大小写/别名绕过
             file.relative_to(PUBLIC_DIR)
         except (ValueError, OSError):
             self._send(404, b"not found", "text/plain")
@@ -529,7 +542,8 @@ class Handler(BaseHTTPRequestHandler):
             ".png": "image/png",
             ".ico": "image/x-icon",
         }
-        self._send(200, file.read_bytes(), types.get(file.suffix, "application/octet-stream"))
+        cache = self._STATIC_CACHE.get(file.suffix, self._NO_CACHE)
+        self._send(200, file.read_bytes(), types.get(file.suffix, "application/octet-stream"), cache)
 
     # ---------- 面板自身 API ----------
     def _client_ip(self) -> str:

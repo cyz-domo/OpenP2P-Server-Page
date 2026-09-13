@@ -349,6 +349,7 @@ async function refreshAll() {
     renderNetwork();
     renderDownload();
     await refreshTunnels(true);
+    loadMemStatus();
   } catch (e) {
     toast("网络错误: " + e, "err");
   }
@@ -797,16 +798,17 @@ function renderNetwork() {
 
   const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
   const members = s.Nodes || [];
-  // 成员连接状态：从隧道缓存推导（成员名在任一设备规则里且 isActive）
-  const sdTunnels = Object.entries(state.tunnelByNode).flatMap(([node, apps]) =>
-    apps.filter((a) => !a.srcPort).map((a) => ({ node, peer: a.peerNode, isActive: a.isActive === 1 })));
+  // 连接状态：优先用 MemApps 实时缓存（subtype=17，成员级组网隧道权威数据）；
+  // 未拉取过时提示拉取，由 loadMemStatus() 异步填充
+  const memApps = state.memByNode || {};
   const statusOf = (name) => {
-    const rel = sdTunnels.filter((t) => t.node === name || t.peer === name);
-    if (!rel.length) return { txt: "无隧道数据", cls: "" };
-    const active = rel.filter((t) => t.isActive).length;
+    const apps = memApps[name];
+    if (!apps) return { txt: "点击「刷新状态」拉取", cls: "dim" };
+    if (!apps.length) return { txt: "· 无隧道", cls: "dim" };
+    const active = apps.filter((a) => a.isActive === 1).length;
     return active > 0
-      ? { txt: `✅ ${active}/${rel.length} 条活跃`, cls: "ok" }
-      : { txt: `· 0/${rel.length} 条活跃`, cls: "dim" };
+      ? { txt: `✅ ${active}/${apps.length} 条活跃`, cls: "ok" }
+      : { txt: `· 0/${apps.length} 条活跃`, cls: "dim" };
   };
 
   const tbody = $("netTable").querySelector("tbody");
@@ -893,6 +895,12 @@ $("btnNetSave").addEventListener("click", async () => {
   }
 });
 
+$("btnMemStatus").addEventListener("click", async () => {
+  toast("正在拉取各成员隧道状态…");
+  await loadMemStatus();
+  toast("连接状态已更新", "ok");
+});
+
 /* 成员隧道明细（MsgPushReportMemApps=17，仅在线成员可查） */
 $("btnMemRefresh").addEventListener("click", async () => {
   const member = $("memSel").value;
@@ -910,6 +918,24 @@ $("btnMemRefresh").addEventListener("click", async () => {
   }
   renderMemApps();
 });
+
+/** 并发拉取全部在线成员的组网隧道状态（subtype=17），刷新成员表连接状态列 */
+async function loadMemStatus() {
+  const members = (state.sdwan && state.sdwan.Nodes) || [];
+  const online = members.filter((m) => {
+    const d = state.devices.find((x) => x.name === m.name);
+    return d && onlineDev(d);
+  });
+  if (!online.length) return;
+  const results = await Promise.allSettled(online.map((m) => pushCmd(m.name, 17, {}, 1)));
+  for (let i = 0; i < online.length; i++) {
+    const r = results[i];
+    if (r.status === "fulfilled" && r.value.status === 200 && Array.isArray(r.value.data.Apps)) {
+      state.memByNode[online[i].name] = r.value.data.Apps;
+    }
+  }
+  if (state.selView === "networks") renderNetwork();
+}
 
 function renderMemApps() {
   const tbody = $("memTable").querySelector("tbody");
@@ -1045,6 +1071,7 @@ document.querySelectorAll(".tab").forEach((t) =>
   t.addEventListener("click", () => {
     switchView(t.dataset.view);
     if (t.dataset.view === "tunnels" && !Object.keys(state.tunnelByNode).length) refreshTunnels();
+    if (t.dataset.view === "networks" && !Object.keys(state.memByNode).length) loadMemStatus();
   })
 );
 
