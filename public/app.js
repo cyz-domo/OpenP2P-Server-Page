@@ -5,6 +5,8 @@ const $ = (id) => document.getElementById(id);
 const API = "/pxp"; // 反向代理前缀
 
 /* ---------------- 状态 ---------------- */
+const tunnelSort = { key: "state", dir: 1 }; // 隧道表排序（默认按连接状态，已连接在前）
+let tlSub = "pf"; // 隧道子视图：pf=端口转发 sd=虚拟组网
 const state = {
   devices: [],
   latestVer: "",
@@ -15,6 +17,7 @@ const state = {
   user: "",
   upstream: "https://console.openpxp.com",
   accounts: [],       // 多账户列表（服务端 /api/state）
+  memByNode: {},      // node -> MemApps[]（subtype=17 成员级组网隧道状态）
   selView: "devices",
 };
 
@@ -355,17 +358,39 @@ async function refreshAll() {
   }
 }
 
-/** 并发拉取所有在线设备的规则列表（MsgPushReportApps=7） */
+/** 并发拉取所有在线设备的规则列表。
+ *  端口转发来自 subtype=7（本机发起的隧道应用）；
+ *  组网隧道全拓扑来自 subtype=17（成员视角，含未活跃对端）——两者合并去重。 */
 async function refreshTunnels(quiet = false) {
   const online = state.devices.filter(onlineDev);
   if (!quiet) toast(`正在拉取 ${online.length} 台在线设备的规则…`);
-  const results = await Promise.allSettled(online.map((d) => pushCmd(d.name, 7, {}, 1)));
+  const [r7, r17] = await Promise.allSettled([
+    Promise.allSettled(online.map((d) => pushCmd(d.name, 7, {}, 1))),
+    Promise.allSettled(online.map((d) => pushCmd(d.name, 17, {}, 1))),
+  ]);
   const map = {};
   for (const d of state.devices) map[d.name] = map[d.name] || [];
-  for (let i = 0; i < online.length; i++) {
-    const r = results[i];
-    if (r.status === "fulfilled" && r.value.status === 200 && Array.isArray(r.value.data.Apps)) {
-      map[online[i].name] = r.value.data.Apps;
+  const put = (i, arr) => { map[online[i].name] = arr; };
+  const get = (res, i) => (res.status === "fulfilled" && res.value[i].status === "fulfilled"
+    && res.value[i].value.status === 200 && Array.isArray(res.value[i].value.data.Apps))
+    ? res.value[i].value.data.Apps : null;
+
+  if (r7.status === "fulfilled") {
+    for (let i = 0; i < online.length; i++) {
+      const apps = get(r7, i);
+      if (apps) put(i, apps.filter((a) => a.srcPort)); // subtype=7 只保留端口转发
+    }
+  }
+  if (r17.status === "fulfilled") {
+    for (let i = 0; i < online.length; i++) {
+      const mem = get(r17, i);
+      if (!mem) continue;
+      // 组网隧道：subtype=17 全量；去掉与 7 中同对端appName的重复（7 里的组网条目是子集）
+      const existing = new Set(map[online[i].name].map((a) => a.peerNode + "|" + (a.appName || "")));
+      for (const a of mem) {
+        const k = a.peerNode + "|" + (a.appName || "");
+        if (!existing.has(k)) map[online[i].name].push(a);
+      }
     }
   }
   state.tunnelByNode = map;
@@ -586,43 +611,116 @@ function ruleType(rule) {
 function renderTunnels() {
   const nodeFilter = $("tlNodeFilter").value || "";
   const kw = $("tlSearch").value.trim().toLowerCase();
-  const showPf = $("tlTypePf").checked;
-  const showSd = $("tlTypeSd").checked;
 
   const sel = $("tlNodeFilter");
   const cur = sel.value;
+  const dotOf = (name) => {
+    const d = state.devices.find((x) => x.name === name);
+    return d && onlineDev(d) ? "🟢" : "⚪";
+  };
   sel.innerHTML = `<option value="">全部设备</option>` +
-    state.devices.map((d) => `<option value="${esc(d.name)}">${esc(d.name)}</option>`).join("");
+    state.devices.map((d) => `<option value="${esc(d.name)}">${dotOf(d.name)} ${esc(d.name)}</option>`).join("");
   sel.value = cur;
 
-  const rows = [];
-  for (const [node, apps] of Object.entries(state.tunnelByNode)) {
-    if (nodeFilter && node !== nodeFilter) continue;
-    for (const a of apps) {
-      const t = ruleType(a);
-      if (t === "pf" && !showPf) continue;
-      if (t === "sd" && !showSd) continue;
-      if (kw) {
-        const hay = [a.appName, a.peerNode, a.dstHost, a.relayNode, a.specRelayNode, a.linkMode].join(" ").toLowerCase();
-        if (!hay.includes(kw)) continue;
-      }
-      rows.push({ node, a, t });
-    }
-  }
 
   const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
   // 连接状态四态推导（字段语义来自实测：isActive=1 已连接；connectTime 为 0001-01-01 零值表示从未连上）
   const ZERO_TIME = "0001-01-01";
   const connStateOf = (a) => {
-    if (a.enabled === 0) return { txt: "已停用", cls: "cs-off" };
-    if (a.isActive === 1) return { txt: "✅ 已连接", cls: "cs-ok" };
+    if (a.enabled === 0) return { txt: "已停用", cls: "cs-off", key: "off" };
+    if (a.isActive === 1) return { txt: "✅ 已连接", cls: "cs-ok", key: "ok" };
     const never = !a.connectTime || String(a.connectTime).startsWith(ZERO_TIME);
     const peerDev = devMap[a.peerNode];
-    if (peerDev && !onlineDev(peerDev)) return { txt: "等待对端上线", cls: "cs-wait" };
-    if (never) return { txt: "正在连接…", cls: "cs-wait" };
-    return { txt: "重试中", cls: "cs-wait" };
+    if (peerDev && !onlineDev(peerDev)) return { txt: "等待对端上线", cls: "cs-wait", key: "peeroff" };
+    if (never) return { txt: "正在连接…", cls: "cs-wait", key: "wait" };
+    return { txt: "重试中", cls: "cs-wait", key: "wait" };
   };
-  $("tlSummary").textContent = `共 ${rows.length} 条`;
+
+    const rows = [];
+  for (const [node, apps] of Object.entries(state.tunnelByNode)) {
+    if (nodeFilter && node !== nodeFilter) continue;
+    for (const a of apps) {
+      const t = ruleType(a);
+      if (kw) {
+        const hay = [a.appName, a.peerNode, a.dstHost, a.relayNode, a.specRelayNode, a.linkMode].join(" ").toLowerCase();
+        if (!hay.includes(kw)) continue;
+      }
+      const cs = connStateOf(a);
+      rows.push({ node, a, t, cs });
+    }
+  }
+
+  // 排序：peer=对端字母序；state=连接状态优先级（已连接 > 连接中 > 等待对端 > 停用）
+  const stateOrder = { ok: 0, wait: 1, peeroff: 2, off: 3 };
+  if (tunnelSort.key === "peer") {
+    rows.sort((x, y) => (x.a.peerNode || "").localeCompare(y.a.peerNode || "") * tunnelSort.dir);
+  } else if (tunnelSort.key === "state") {
+    rows.sort((x, y) => ((stateOrder[x.cs.key] ?? 9) - (stateOrder[y.cs.key] ?? 9)) * tunnelSort.dir);
+  }
+  // 拆分：端口转发 → tlTable；组网隧道 → sdTable
+  const pfRows = rows.filter((r) => r.t === "pf");
+  const sdRows = rows.filter((r) => r.t === "sd");
+  $("cntPf").textContent = pfRows.length;
+  $("cntSd").textContent = sdRows.length;
+  const visible = tlSub === "pf" ? pfRows : sdRows;
+  $("tlSummary").textContent = `共 ${visible.length} 条`;
+
+  if (tlSub === "pf") {
+    const tbody = $("tlTable").querySelector("tbody");
+    tbody.innerHTML = pfRows.map(({ node, a, cs }) => {
+    const dev = devMap[node];
+    const relay = a.specRelayNode
+      ? `${esc(a.specRelayNode)}${a.relayNode && a.relayNode !== a.specRelayNode ? ` (实际:${esc(a.relayNode)})` : ""}`
+      : (a.relayNode ? `<span class="muted">自动:</span> ${esc(a.relayNode)}` : `<span class="muted">P2P 直连</span>`);
+    const peerDev = devMap[a.peerNode];
+    return `<tr>
+      <td>${esc(node)}${dev && !onlineDev(dev) ? ' <span class="tag">离线</span>' : ""}</td>
+      <td class="name">${esc(a.appName)}</td>
+      <td><span class="tag pf">${esc((a.protocol || "tcp").toUpperCase())}</span></td>
+      <td><b class="ip">${esc(a.srcPort)}</b></td>
+      <td>${esc(a.peerNode || "-")}${peerDev && !onlineDev(peerDev) ? ' <span class="tag">对端离线</span>' : ""}</td>
+      <td class="ip">${esc(a.dstHost || "localhost")}:${esc(a.dstPort)}</td>
+      <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
+      <td class="relay">${relay}</td>
+      <td class="${cs.cls}">${cs.txt}</td>
+      <td>${a.enabled === 0 ? `<a class="tag" style="color:var(--danger)">停用</a>` : "✅"}</td>
+      <td class="op">
+        <button class="btn" data-act="toggle" data-node="${esc(node)}" data-app="${esc(a.appName)}"
+          data-pf="${esc(a.protocol || "")}" data-port="${esc(a.srcPort || 0)}" data-peer="${esc(a.peerNode || "")}"
+          data-en="${a.enabled === 0 ? 1 : 0}">${a.enabled === 0 ? "启用" : "停用"}</button>
+        <button class="btn" data-act="edit" data-node="${esc(node)}" data-app="${esc(a.appName)}">编辑</button>
+        <button class="btn danger" data-act="del" data-node="${esc(node)}" data-app="${esc(a.appName)}"
+          data-pf="${esc(a.protocol || "")}" data-port="${esc(a.srcPort || 0)}">删除</button>
+      </td>
+    </tr>`;
+    }).join("") || `<tr><td colspan="11" class="muted" style="text-align:center">无端口转发规则</td></tr>`;
+  } else {
+    const tbody = $("sdTable").querySelector("tbody");
+    tbody.innerHTML = sdRows.map(({ node, a, cs }) => {
+    const dev = devMap[node];
+    const peerDev = devMap[a.peerNode];
+    const relay = a.specRelayNode || a.relayNode || "";
+    const peerIp = a.peerIP || "-";
+    const nat = a.peerNatType != null ? "NAT" + a.peerNatType : "-";
+    return `<tr>
+      <td>${esc(node)}${dev && !onlineDev(dev) ? ' <span class="tag">离线</span>' : ""}</td>
+      <td class="name">${esc(a.peerNode || "-")}${peerDev && !onlineDev(peerDev) ? ' <span class="tag">对端离线</span>' : ""}</td>
+      <td class="ip">${copyBtn(peerIp)}</td>
+      <td>${esc(nat)}</td>
+      <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
+      <td class="relay">${relay ? esc(relay) : '<span class="muted">P2P 直连</span>'}</td>
+      <td class="${cs.cls}">${cs.txt}</td>
+      <td class="ip">${esc(fmtTime(a.connectTime))}</td>
+    </tr>`;
+    }).join("") || `<tr><td colspan="8" class="muted" style="text-align:center">无组网隧道</td></tr>`;
+  }
+
+  // 排序列头箭头（两张表各自处理）
+  document.querySelectorAll("#tlTable th.sortable, #sdTable th.sortable").forEach((th) => {
+    const arrow = th.querySelector(".sort-arrow");
+    arrow.textContent = tunnelSort.key === th.dataset.sort ? (tunnelSort.dir === 1 ? " ▲" : " ▼") : "";
+    th.classList.toggle("sorted", tunnelSort.key === th.dataset.sort);
+  });
 
   let activeCount = 0;
   for (const apps of Object.values(state.tunnelByNode)) {
@@ -632,40 +730,27 @@ function renderTunnels() {
   }
   if ($("statActiveTunnels")) $("statActiveTunnels").textContent = activeCount;
 
-  const tbody = $("tlTable").querySelector("tbody");
-  tbody.innerHTML = rows.map(({ node, a, t }) => {
-    const dev = devMap[node];
-    const relay = a.specRelayNode
-      ? `${esc(a.specRelayNode)}${a.relayNode && a.relayNode !== a.specRelayNode ? ` (实际:${esc(a.relayNode)})` : ""}`
-      : (a.relayNode ? `<span class="muted">自动:</span> ${esc(a.relayNode)}` : `<span class="muted">P2P 直连</span>`);
-    const cs = connStateOf(a);
-    const peerDev = devMap[a.peerNode];
-    return `<tr>
-      <td>${esc(node)}${dev && !onlineDev(dev) ? ' <span class="tag">离线</span>' : ""}</td>
-      <td class="name">${esc(a.appName)}</td>
-      <td><span class="tag ${t === "pf" ? "pf" : "sd"}">${t === "pf" ? "端口转发" : "组网隧道"}</span></td>
-      <td>${t === "pf" ? `<b class="ip">${esc(a.protocol || "tcp")}:${esc(a.srcPort)}</b>` : "-"}</td>
-      <td>${esc(a.peerNode || "-")}${peerDev && !onlineDev(peerDev) ? ' <span class="tag">对端离线</span>' : ""}</td>
-      <td>${t === "pf" ? `${esc(a.dstHost || "localhost")}:${esc(a.dstPort)}` : "-"}</td>
-      <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
-      <td class="relay">${relay}</td>
-      <td class="${cs.cls}">${cs.txt}</td>
-      <td>${a.enabled === 0 ? `<a class="tag" style="color:var(--danger)">停用</a>` : "✅"}</td>
-      <td class="op">
-        <button class="btn" data-act="toggle" data-node="${esc(node)}" data-app="${esc(a.appName)}"
-          data-pf="${esc(a.protocol || "")}" data-port="${esc(a.srcPort || 0)}" data-peer="${esc(a.peerNode || "")}"
-          data-en="${a.enabled === 0 ? 1 : 0}">${a.enabled === 0 ? "启用" : "停用"}</button>
-        ${t === "pf" ? `<button class="btn" data-act="edit" data-node="${esc(node)}" data-app="${esc(a.appName)}">编辑</button>` : ""}
-        ${t === "pf" ? `<button class="btn danger" data-act="del" data-node="${esc(node)}" data-app="${esc(a.appName)}"
-          data-pf="${esc(a.protocol || "")}" data-port="${esc(a.srcPort || 0)}">删除</button>` : ""}
-      </td>
-    </tr>`;
-  }).join("") || `<tr><td colspan="11" class="muted" style="text-align:center">无规则（点击上方「↻ 刷新」拉取在线设备规则）</td></tr>`;
+
 }
 
+document.querySelectorAll(".subtab[data-tl]").forEach((b) =>
+  b.addEventListener("click", () => {
+    tlSub = b.dataset.tl;
+    document.querySelectorAll(".subtab[data-tl]").forEach((x) => x.classList.toggle("active", x === b));
+    $("tlPfWrap").classList.toggle("hidden", tlSub !== "pf");
+    $("tlSdWrap").classList.toggle("hidden", tlSub !== "sd");
+    renderTunnels();
+  })
+);
+document.querySelectorAll("#tlTable th.sortable, #sdTable th.sortable").forEach((th) =>
+  th.addEventListener("click", () => {
+    const k = th.dataset.sort;
+    if (tunnelSort.key === k) tunnelSort.dir *= -1;
+    else { tunnelSort.key = k; tunnelSort.dir = 1; }
+    renderTunnels();
+  })
+);
 $("tlSearch").addEventListener("input", renderTunnels);
-$("tlTypePf").addEventListener("change", renderTunnels);
-$("tlTypeSd").addEventListener("change", renderTunnels);
 $("tlNodeFilter").addEventListener("change", renderTunnels);
 
 $("tlTable").addEventListener("click", async (ev) => {
@@ -818,7 +903,7 @@ function renderNetwork() {
     const on = dev && onlineDev(dev);
     const pubIp = dev ? dev.ip : "-";
     return `<tr data-idx="${i}">
-      <td class="name">${esc(m.name)}${dev ? "" : ' <span class="tag" style="color:var(--red)">不在设备列表</span>'}</td>
+      <td class="name"><a class="member-link" data-jump="${esc(m.name)}" title="查看该成员的隧道连接状态">${esc(m.name)}</a>${dev ? "" : ' <span class="tag" style="color:var(--red)">不在设备列表</span>'}</td>
       <td><input class="input ip-input" style="width:140px" value="${esc(m.ip || "")}" data-k="ip"></td>
       <td class="ip">${copyBtn(pubIp, "ip")}</td>
       <td><span class="dot ${on ? "on" : "off"}"></span>${dev ? (on ? "在线" : "离线") : "-"}</td>
@@ -862,6 +947,15 @@ $("memberForm").addEventListener("submit", (ev) => {
 });
 
 $("netTable").addEventListener("click", (ev) => {
+  // 点击成员名 → 跳转隧道规则页并按该成员筛选
+  const link = ev.target.closest(".member-link[data-jump]");
+  if (link) {
+    switchView("tunnels");
+    $("tlNodeFilter").value = link.dataset.jump;
+    renderTunnels();
+    toast(`已按设备「${link.dataset.jump}」筛选隧道`, "ok");
+    return;
+  }
   const btn = ev.target.closest("button[data-act=rm]");
   if (!btn) return;
   const idx = +btn.closest("tr").dataset.idx;
@@ -887,11 +981,28 @@ $("btnNetSave").addEventListener("click", async () => {
       s.Nodes[idx].resource = tr.querySelector(".res-input").value.trim();
     }
   });
-  const rsp = await pxp("/api/v1/sdwan/edit", { method: "POST", body: s });
-  if (rsp.status === 200) {
-    toast("虚拟网络已保存并下发（含子网代理配置）");
-  } else {
-    toast("保存失败: " + JSON.stringify(rsp.data).slice(0, 160), "err");
+  const saveBtn = $("btnNetSave");
+  saveBtn.disabled = true;
+  saveBtn.textContent = "保存中…";
+  try {
+    const rsp = await pxp("/api/v1/sdwan/edit", { method: "POST", body: s });
+    if (rsp.status === 200) {
+      // 回读服务端配置，确认子网代理等变更真实生效
+      const verify = await pxp("/api/v1/sdwans/");
+      const saved = verify.status === 200 && verify.data.Nodes ? verify.data : null;
+      const savedRes = saved ? saved.Nodes.map((n) => `${n.name}:${n.resource || "∅"}`).join(" ") : "";
+      const localRes = s.Nodes.map((n) => `${n.name}:${n.resource || "∅"}`).join(" ");
+      const synced = saved && savedRes === localRes;
+      toast(synced
+        ? "✓ 已保存：子网代理配置已生效并下发"
+        : "已提交保存（服务端确认回执中，如未生效请稍后点「↻ 刷新」核对）", "ok");
+      if (saved) { state.sdwan = saved; renderNetwork(); }
+    } else {
+      toast("保存失败: " + JSON.stringify(rsp.data).slice(0, 160), "err");
+    }
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = "保存整网配置";
   }
 });
 

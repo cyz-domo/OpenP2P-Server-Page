@@ -215,28 +215,40 @@
 
     <!-- 隧道规则 -->
     <section id="view-tunnels" class="view hidden">
+      <div class="subtabs">
+        <button class="subtab active" data-tl="pf">端口转发 <span id="cntPf" class="counter-badge">0</span></button>
+        <button class="subtab" data-tl="sd">虚拟组网 <span id="cntSd" class="counter-badge">0</span></button>
+      </div>
       <div class="toolbar">
         <div class="select-wrap">
-          <select id="tlNodeFilter" class="input sel"></select>
+          <select id="tlNodeFilter" class="input sel" title="按所在设备筛选"></select>
         </div>
         <div class="search-input-wrap">
           <svg class="search-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           <input id="tlSearch" class="input input-search" placeholder="搜索规则名 / 对端 / 目标…">
-        </div>
-        <div class="filter-group">
-          <label class="chk"><input id="tlTypePf" type="checkbox" checked> <span>端口转发</span></label>
-          <label class="chk"><input id="tlTypeSd" type="checkbox" checked> <span>组网隧道</span></label>
         </div>
         <div class="spacer"></div>
         <span id="tlSummary" class="counter-badge">共 0 条</span>
         <button id="btnAddRule" class="btn primary">＋ 新建转发规则</button>
       </div>
 
-      <div class="table-wrap">
+      <!-- 端口转发表 -->
+      <div class="table-wrap" id="tlPfWrap">
         <table class="tbl" id="tlTable">
           <thead><tr>
-            <th>所在设备</th><th>规则名</th><th>类型</th><th>本地监听</th><th>对端设备</th>
-            <th>目标服务</th><th>链路模式</th><th>下一条 / 中继节点</th><th>连接状态</th><th>启用状态</th><th class="th-op">操作</th>
+            <th>所在设备</th><th>规则名</th><th>协议</th><th>本地监听</th><th class="sortable" data-sort="peer">对端设备 <span class="sort-arrow"></span></th>
+            <th>目标服务</th><th>链路模式</th><th>下一条 / 中继节点</th><th class="sortable" data-sort="state">连接状态 <span class="sort-arrow"></span></th><th>启用状态</th><th class="th-op">操作</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <!-- 虚拟组网表 -->
+      <div class="table-wrap hidden" id="tlSdWrap">
+        <table class="tbl" id="sdTable">
+          <thead><tr>
+            <th>所在成员</th><th class="sortable" data-sort="peer">对端成员 <span class="sort-arrow"></span></th>
+            <th>对端 IP</th><th>NAT</th><th>链路模式</th><th>下一条 / 中继节点</th><th class="sortable" data-sort="state">连接状态</th><th>最近连接时间</th>
           </tr></thead>
           <tbody></tbody>
         </table>

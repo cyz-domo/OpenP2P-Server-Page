@@ -5,8 +5,8 @@
 
 :root,
 :root[data-theme="dark"] {
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
-  --mono: ui-monospace, "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, Menlo, monospace;
+  --sans: "HarmonyOS Sans SC", "MiSans", "Source Han Sans SC", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", "Sarasa Mono SC", "Fira Code", ui-monospace, Consolas, monospace;
 
   /* 颜色层阶 - 暗色 (Dark Obsidian & Slate) */
   --bg: #090d16;
@@ -1369,3 +1369,37 @@ dialog form {
   .stats-grid { grid-template-columns: 1fr; }
   .batch-actions { width: 100%; justify-content: flex-start; }
 }
+
+/* 组网成员名链接：可点击跳转隧道筛选 */
+.member-link {
+  color: var(--text); text-decoration: none; cursor: pointer;
+  border-bottom: 1px dashed var(--muted);
+}
+.member-link:hover { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* 可排序列头 */
+#tlTable th.sortable { cursor: pointer; user-select: none; }
+#tlTable th.sortable:hover { color: var(--accent); }
+#tlTable th.sorted { color: var(--accent); }
+#tlTable .sort-arrow { font-size: 10px; }
+
+/* ================= 隧道子标签（端口转发 / 虚拟组网） ================= */
+.subtabs {
+  display: flex; gap: 6px; margin-bottom: 14px;
+}
+.subtab {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); font: 13.5px var(--sans); padding: 8px 18px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 8px;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.subtab:hover { color: var(--text); border-color: var(--accent); }
+.subtab.active {
+  background: var(--accent-dim); border-color: var(--accent);
+  color: var(--accent); font-weight: 600;
+}
+.subtab .counter-badge {
+  background: var(--panel3); border-radius: 10px; padding: 0 8px;
+  font-size: 11.5px; font-family: var(--mono);
+}
+.subtab.active .counter-badge { background: var(--panel2); }
