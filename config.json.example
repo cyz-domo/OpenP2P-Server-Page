@@ -1,4 +1,5 @@
 {
+  "_security_note": "⚠️ 此文件包含敏感凭证模板！请复制为 config.json 后填入真实信息。config.json 已在 .gitignore 中排除，切勿提交到公开仓库！",
   "upstream": "https://console.openpxp.com",
   "user": "your_username",
   "password": "your_password",

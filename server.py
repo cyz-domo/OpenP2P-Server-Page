@@ -14,7 +14,11 @@
 
 import argparse
 import base64
+import hashlib
+import hmac
 import json
+import os
+import re
 import secrets
 import ssl
 import sys
@@ -36,6 +40,27 @@ MAX_BODY = 1 << 20  # 请求体上限 1MB，防大包打爆内存
 # 允许代理的路径前缀：只放行官方控制台 API 与下载，防把服务器当任意代理用
 _PROXY_ALLOW = ("/api/",)
 
+# ---------- 安全配置 ----------
+# CSP 策略：限制脚本/样式来源，防止 XSS
+_CSP_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self'; "
+    "font-src 'self'; "
+    "object-src 'none'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+# ---------- 全局速率限制 ----------
+RATE_LIMIT_WINDOW = 60     # 限制窗口 60 秒
+RATE_LIMIT_MAX = 30        # 每窗口最多 30 次请求（登录等敏感接口更严格）
+_rate_lock = threading.Lock()
+_rate_limits: dict = {}     # ip -> [count, window_start]
+
 # ---------- 登录防爆破 ----------
 CAPTCHA_TTL = 300        # 验证码 5 分钟有效
 CAPTCHA_LEN = 4
@@ -46,10 +71,31 @@ _captchas: dict = {}     # captcha_id -> {"code": str, "exp": float, "used": boo
 _fail_lock = threading.Lock()
 _failures: dict = {}     # ip -> [fail_count, first_fail_ts]
 
+# 登录专用速率限制（更严格）
+LOGIN_RATE_LIMIT = 10    # 每窗口最多 10 次登录尝试
+
 _ssl_ctx = ssl.create_default_context()
-# 官方 CDN 在部分网络环境下返回自签证书链（如运营商劫持/代理），放宽为不校验（面板只读自身 token 数据）
 _ssl_ctx.check_hostname = False
 _ssl_ctx.verify_mode = ssl.CERT_NONE
+
+
+def _check_rate_limit(ip: str, limit: int = RATE_LIMIT_MAX) -> bool:
+    now = time.time()
+    with _rate_lock:
+        item = _rate_limits.get(ip)
+        if not item or now - item[1] > RATE_LIMIT_WINDOW:
+            _rate_limits[ip] = [1, now]
+            return True
+        if item[0] >= limit:
+            return False
+        item[0] += 1
+        return True
+
+
+def _sanitize_error(msg: str) -> str:
+    msg = str(msg)[:200]
+    msg = re.sub(r'[<>"\']', '', msg)
+    return msg
 
 
 def load_config() -> dict:
@@ -76,6 +122,20 @@ def tighten_config_perm() -> None:
             os.chmod(CONFIG_FILE, 0o600)
         except OSError:
             pass
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+    return f"{salt}:{h.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    if ':' not in stored:
+        return hmac.compare_digest(password, stored)
+    salt, h = stored.split(':', 1)
+    check = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+    return hmac.compare_digest(check.hex(), h)
 
 
 # ---------- 验证码与失败锁定 ----------
@@ -315,9 +375,9 @@ class Upstream:
             with urllib.request.urlopen(req, timeout=20, context=_ssl_ctx) as rsp:
                 data = json.loads(rsp.read().decode())
         except urllib.error.HTTPError as e:
-            return {"error": e.code, "detail": e.read().decode(errors="replace")[:300]}
+            return {"error": e.code, "detail": _sanitize_error(e.read().decode(errors="replace"))[:300]}
         except Exception as e:
-            return {"error": -1, "detail": str(e)}
+            return {"error": -1, "detail": _sanitize_error(str(e))}
         if data.get("error") != 0 or not data.get("token"):
             return data
         self._store(user, data["token"])
@@ -339,9 +399,9 @@ class Upstream:
             with urllib.request.urlopen(req, timeout=20, context=_ssl_ctx) as rsp:
                 data = json.loads(rsp.read().decode())
         except urllib.error.HTTPError as e:
-            return {"error": e.code, "detail": "token 已失效或官方服务不可达"}
+            return {"error": e.code, "detail": _sanitize_error("token 已失效或官方服务不可达")}
         except Exception as e:
-            return {"error": -1, "detail": str(e)}
+            return {"error": -1, "detail": _sanitize_error(str(e))}
         if data.get("error") != 0:
             return {"error": -1, "detail": "token 无效（官方校验未通过）"}
         self._store(self.jwt_user(token), token)
@@ -370,9 +430,9 @@ class Upstream:
             with urllib.request.urlopen(req, timeout=PUSH_TIMEOUT, context=_ssl_ctx) as rsp:
                 return rsp.status, rsp.read(), dict(rsp.headers)
         except urllib.error.HTTPError as e:
-            return e.code, e.read(), dict(e.headers)
+            return e.code, _sanitize_error(e.read()).encode(), dict(e.headers)
         except Exception as e:
-            return 502, json.dumps({"error": -2, "detail": f"upstream: {e}"}).encode(), {}
+            return 502, json.dumps({"error": -2, "detail": f"upstream: {_sanitize_error(str(e))}"}).encode(), {}
 
 
 _upstream: Upstream | None = None
@@ -401,7 +461,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-XSS-Protection", "1; mode=block")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Content-Security-Policy", _CSP_POLICY)
+        if self.headers.get("X-Forwarded-Proto") == "https" or self.server.is_ssl:
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         self.end_headers()
         self.wfile.write(body)
 
@@ -498,6 +565,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(_upstream.remove_account((data.get("user") or "").strip()))
         elif self.path == "/api/captcha" and method == "POST":
+            ip = self._client_ip()
+            if not _check_rate_limit(ip, 20):
+                self._json({"error": 429, "detail": "请求过于频繁"})
+                return
             theme = "light" if "light" in (self.headers.get("X-Panel-Theme") or "") else "dark"
             cid, svg = new_captcha(theme=theme)
             self._json({
@@ -525,7 +596,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": -1, "detail": "请求体不是合法 JSON"})
                 return
             ip = self._client_ip()
-            # 账号密码模式必须过验证码 + 未被锁定
+            if not _check_rate_limit(ip, LOGIN_RATE_LIMIT):
+                self._json({"error": 429, "detail": "请求过于频繁，请稍后再试"})
+                return
             if is_locked(ip):
                 self._json({"error": 429, "detail": "失败次数过多，账号锁定 15 分钟，请稍后再试"})
                 return
@@ -548,21 +621,23 @@ class Handler(BaseHTTPRequestHandler):
             if rsp.get("error") == 0:
                 clear_fails(ip)
                 if data.get("remember"):
-                    _upstream._store(user, _upstream.token, password)  # 密码存账户槽位，用于 token 过期自动重登
+                    _upstream._store(user, _upstream.token, password)
             else:
                 record_fail(ip)
                 left = LOCK_THRESHOLD - _failures.get(ip, [0, 0])[0]
-                rsp["detail"] = (rsp.get("detail") or "用户名或密码错误")[:120] + \
+                rsp["detail"] = _sanitize_error(rsp.get("detail") or "用户名或密码错误")[:120] + \
                     (f"（剩余 {max(left,0)} 次尝试）" if 0 < left <= LOCK_THRESHOLD else "")
             self._json({"error": rsp.get("error"), "detail": rsp.get("detail", "")})
         elif self.path == "/api/login-token" and method == "POST":
-            # Token 登录：官方 profile 校验通过即入库。同样要求验证码（防 token 猜测爆破）
             try:
                 data = json.loads(raw.decode() or "{}")
             except json.JSONDecodeError:
                 self._json({"error": -1, "detail": "请求体不是合法 JSON"})
                 return
             ip = self._client_ip()
+            if not _check_rate_limit(ip, LOGIN_RATE_LIMIT):
+                self._json({"error": 429, "detail": "请求过于频繁，请稍后再试"})
+                return
             if is_locked(ip):
                 self._json({"error": 429, "detail": "失败次数过多，账号锁定 15 分钟，请稍后再试"})
                 return
@@ -581,6 +656,8 @@ class Handler(BaseHTTPRequestHandler):
                 clear_fails(ip)
             else:
                 record_fail(ip)
+                if "detail" in rsp:
+                    rsp["detail"] = _sanitize_error(rsp["detail"])
             self._json(rsp)
         elif self.path == "/api/logout" and method == "POST":
             # 仅清除当前激活账户的 token（保留其他账户）
