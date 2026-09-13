@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenP2P 管理面板</title>
+<link rel="stylesheet" href="app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%2310b981%22 stroke-width=%222%22><circle cx=%2212%22 cy=%225%22 r=%222.2%22/><circle cx=%225%22 cy=%2219%22 r=%222.2%22/><circle cx=%2219%22 cy=%2219%22 r=%222.2%22/><path d=%22M11 7l-5 10M13 7l5 10M7.2 19h9.6%22/></svg>">
+</head>
+<body>
+<div id="app">
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="5" r="2.2"/>
+          <circle cx="5" cy="19" r="2.2"/>
+          <circle cx="19" cy="19" r="2.2"/>
+          <path d="M11 7l-5 10M13 7l5 10M7.2 19h9.6"/>
+        </svg>
+      </div>
+      <div class="brand-info">
+        <b class="brand-title">OpenP2P</b>
+        <span class="brand-badge">Panel</span>
+      </div>
+      <div id="connState" class="badge off">未连接</div>
+    </div>
+
+    <div class="topbar-right">
+      <div class="acct-wrap">
+        <button id="btnAcct" class="btn ghost acct-btn" title="切换账户">
+          <span class="acct-avatar">👤</span>
+          <span id="userInfo" class="user-text">未登录</span>
+          <svg class="chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div id="acctMenu" class="acct-menu hidden"></div>
+      </div>
+      <button id="btnSettings" class="btn ghost icon-btn" title="控制台设置与上游域名">⚙️</button>
+      <button id="btnTheme" class="btn ghost icon-btn" title="切换深色/浅色主题">🌙</button>
+      <button id="btnRefreshAll" class="btn ghost" title="重新拉取全部数据">
+        <svg class="btn-svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        <span>刷新</span>
+      </button>
+      <button id="btnLogout" class="btn ghost danger" title="退出当前登录">
+        <svg class="btn-svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <span>退出</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- 登录视图 -->
+  <section id="loginView" class="login-wrap hidden">
+    <div class="login-ambient"></div>
+    <form id="loginForm" class="login-card">
+      <div class="login-header">
+        <div class="login-icon">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="2.2"/><circle cx="5" cy="19" r="2.2"/><circle cx="19" cy="19" r="2.2"/><path d="M11 7l-5 10M13 7l5 10M7.2 19h9.6"/></svg>
+        </div>
+        <h2>登录 OpenP2P 管理面板</h2>
+        <p class="muted">凭据安全加密保存在本机，直接与 OpenP2P 官方节点通信</p>
+      </div>
+
+      <div class="upstream-card">
+        <label class="form-group">
+          <div class="upstream-header">
+            <span class="label-text">官方控制台地址 (Upstream)</span>
+            <div class="upstream-presets">
+              <button type="button" class="btn-link" data-upstream="https://console.openpxp.com">官方默认</button>
+              <button type="button" class="btn-link" data-upstream="https://console.openp2p.cn">国内镜像</button>
+            </div>
+          </div>
+          <input id="loginUpstream" class="input mono" placeholder="https://console.openpxp.com" value="https://console.openpxp.com" spellcheck="false">
+        </label>
+      </div>
+
+      <div class="seg" role="tablist">
+        <button type="button" class="seg-btn active" data-mode="password">账号密码登录</button>
+        <button type="button" class="seg-btn" data-mode="token">官方 Token 登录</button>
+      </div>
+
+      <div id="modePassword">
+        <label class="form-group">
+          <span class="label-text">用户名 / 账号</span>
+          <input id="loginUser" class="input" autocomplete="username" placeholder="输入您的 OpenP2P 账号">
+        </label>
+        <label class="form-group">
+          <span class="label-text">密码</span>
+          <input id="loginPass" class="input" type="password" autocomplete="current-password" placeholder="输入密码">
+        </label>
+        <label class="chk">
+          <input id="loginRemember" type="checkbox" checked>
+          <span>记住密码（Token 过期后自动静默重登）</span>
+        </label>
+      </div>
+
+      <div id="modeToken" class="hidden">
+        <label class="form-group">
+          <span class="label-text">官方控制台 Token (JWT)</span>
+          <textarea id="loginToken" class="input mono" rows="3" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." spellcheck="false"></textarea>
+        </label>
+        <p class="field-hint">💡 提示：从控制台网页 localStorage 读取 <code>token</code> 变量即可，适合免密码直接绑定。</p>
+      </div>
+
+      <div class="captcha-row">
+        <label class="form-group">
+          <span class="label-text">图形验证码</span>
+          <input id="loginCaptcha" class="input captcha-input" maxlength="4" autocomplete="off" placeholder="输入数字">
+        </label>
+        <div class="captcha-img-wrap" title="点击刷新验证码">
+          <img id="captchaImg" class="captcha-img" alt="验证码，点击刷新">
+          <span class="captcha-hint">刷新</span>
+        </div>
+      </div>
+
+      <div id="loginErr" class="err hidden"></div>
+      <button class="btn primary block btn-lg" type="submit">立即登录</button>
+    </form>
+  </section>
+
+  <!-- 主视图 -->
+  <main id="mainView" class="hidden">
+    <nav class="tabs">
+      <button class="tab active" data-view="devices">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        <span>设备总览</span>
+      </button>
+      <button class="tab" data-view="tunnels">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <span>隧道规则</span>
+      </button>
+      <button class="tab" data-view="networks">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        <span>虚拟网络</span>
+      </button>
+      <button class="tab" data-view="download">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        <span>下载安装</span>
+      </button>
+    </nav>
+
+    <!-- 设备总览 -->
+    <section id="view-devices" class="view">
+      <!-- 统计指标卡片 KPI -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-icon icon-dev">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          </div>
+          <div class="stat-info">
+            <span class="stat-label">总设备数</span>
+            <span id="statTotalDev" class="stat-val">0</span>
+          </div>
+        </div>
+
+        <div class="stat-card online">
+          <div class="stat-icon icon-online">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          </div>
+          <div class="stat-info">
+            <span class="stat-label">在线运行</span>
+            <div class="stat-val-row">
+              <span id="statOnlineDev" class="stat-val">0</span>
+              <span class="pulse-beacon"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="stat-card offline">
+          <div class="stat-icon icon-offline">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+          </div>
+          <div class="stat-info">
+            <span class="stat-label">离线设备</span>
+            <span id="statOfflineDev" class="stat-val">0</span>
+          </div>
+        </div>
+
+        <div class="stat-card tunnels">
+          <div class="stat-icon icon-tunnels">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          </div>
+          <div class="stat-info">
+            <span class="stat-label">活跃隧道 / 规则</span>
+            <span id="statActiveTunnels" class="stat-val">0</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="search-input-wrap">
+          <svg class="search-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input id="devSearch" class="input input-search" placeholder="搜索设备名 / IP / 操作系统…">
+        </div>
+        <label class="chk toggle-chk"><input id="devOnlyOnline" type="checkbox"> <span>仅显示在线</span></label>
+        <div class="spacer"></div>
+        <div class="batch-actions">
+          <button id="btnBatchRestart" class="btn warn" disabled>⚡ 重启所选</button>
+          <button id="btnBatchUpgrade" class="btn" disabled>⬆ 升级所选</button>
+          <button id="btnBatchDelete" class="btn danger" disabled>🗑 删除所选</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="tbl" id="devTable">
+          <thead><tr>
+            <th width="40"><input id="devChkAll" type="checkbox"></th>
+            <th>状态</th><th>设备名</th><th>内网 IP</th><th>公网 IP</th><th>系统环境</th>
+            <th>NAT 类型</th><th>版本</th><th>带宽上限</th><th>最近活跃时间</th><th class="th-op">操作</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 隧道规则 -->
+    <section id="view-tunnels" class="view hidden">
+      <div class="toolbar">
+        <div class="select-wrap">
+          <select id="tlNodeFilter" class="input sel"></select>
+        </div>
+        <div class="search-input-wrap">
+          <svg class="search-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input id="tlSearch" class="input input-search" placeholder="搜索规则名 / 对端 / 目标…">
+        </div>
+        <div class="filter-group">
+          <label class="chk"><input id="tlTypePf" type="checkbox" checked> <span>端口转发</span></label>
+          <label class="chk"><input id="tlTypeSd" type="checkbox" checked> <span>组网隧道</span></label>
+        </div>
+        <div class="spacer"></div>
+        <span id="tlSummary" class="counter-badge">共 0 条</span>
+        <button id="btnAddRule" class="btn primary">＋ 新建转发规则</button>
+      </div>
+
+      <div class="table-wrap">
+        <table class="tbl" id="tlTable">
+          <thead><tr>
+            <th>所在设备</th><th>规则名</th><th>类型</th><th>本地监听</th><th>对端设备</th>
+            <th>目标服务</th><th>链路模式</th><th>下一条 / 中继节点</th><th>连接状态</th><th>启用状态</th><th class="th-op">操作</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint-box">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        <span>链路与下一条数据由各节点实时上报（relayNode / specRelayNode / linkMode），官方控制台默认不展示这些深层调试信息。</span>
+      </div>
+    </section>
+
+    <!-- 虚拟网络 -->
+    <section id="view-networks" class="view hidden">
+      <div id="netLoading" class="loading-state">
+        <div class="spinner"></div>
+        <span>正在读取虚拟网络配置…</span>
+      </div>
+      <div id="netEditor" class="hidden">
+        <div class="net-card">
+          <div class="card-title-row">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+              <span>虚拟专网 (SD-WAN) 基础参数</span>
+            </div>
+            <button id="btnNetSave" class="btn primary">保存整网配置</button>
+          </div>
+
+          <div class="net-form-grid">
+            <label class="form-group">
+              <span class="label-text">网络名称</span>
+              <input id="netName" class="input">
+            </label>
+            <label class="form-group">
+              <span class="label-text">网关 CIDR</span>
+              <input id="netGateway" class="input" placeholder="10.11.1.254/24">
+            </label>
+            <label class="form-group">
+              <span class="label-text">组网模式</span>
+              <select id="netMode" class="input sel">
+                <option value="fullmesh">P2P 全互联 (Full-Mesh)</option>
+                <option value="central">中心辐射 (Hub-Spoke)</option>
+              </select>
+            </label>
+            <label id="netCentralWrap" class="form-group">
+              <span class="label-text">中心节点</span>
+              <select id="netCentral" class="input sel"></select>
+            </label>
+            <label class="form-group">
+              <span class="label-text">打洞优先级</span>
+              <select id="netPunch" class="input sel">
+                <option value="1">TCP 优先（推荐）</option>
+                <option value="0">UDP 优先</option>
+                <option value="2">仅限 TCP</option>
+                <option value="4">仅限 UDP</option>
+              </select>
+            </label>
+            <label class="form-group">
+              <span class="label-text">MTU 大小</span>
+              <input id="netMtu" class="input" type="number" placeholder="1420">
+            </label>
+          </div>
+        </div>
+
+        <div class="section-divider"></div>
+
+        <div class="toolbar">
+          <div class="sub-header">
+            <b>网络成员 / 虚拟 IP / 子网代理</b>
+            <span class="muted"><code>resource</code> 字段可配置节点背后的局域网网段（如 192.168.3.0/24，多网段英文逗号分隔）</span>
+          </div>
+          <div class="spacer"></div>
+          <button id="btnBatchAddMember" class="btn">＋ 批量添加节点</button>
+        </div>
+
+        <div class="table-wrap">
+          <table class="tbl" id="netTable">
+            <thead><tr>
+              <th>节点设备名</th><th>分配虚拟 IP</th><th>公网 IP</th>
+              <th>在线状态</th><th>隧道连接状态</th><th>子网代理 (Resource)</th><th class="th-op">操作</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <!-- 成员隧道明细 -->
+        <div class="sub-section">
+          <div class="toolbar">
+            <div class="sub-header">
+              <b>成员隧道状态透视</b>
+              <span id="memSummary" class="muted">查看成员在当前虚拟网络内的实时直连或中继状态</span>
+            </div>
+            <div class="spacer"></div>
+            <select id="memSel" class="input sel"></select>
+            <button id="btnMemRefresh" class="btn">立即读取</button>
+          </div>
+          <div class="table-wrap">
+            <table class="tbl" id="memTable">
+              <thead><tr>
+                <th>本端节点</th><th>对端节点</th><th>链路模式</th><th>中继节点</th><th>连接状态</th><th>最后连接时间</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 下载安装 -->
+    <section id="view-download" class="view hidden">
+      <div class="dl-intro">
+        <div class="dl-intro-text">
+          <h3>客户端下载与一键安装中心</h3>
+          <p class="muted">所有安装链接与命令已自动内嵌您的专属 <code>InstallToken</code>，安装完毕后设备将自动上线并进入您的面板。当前最新官方版本：<b id="dlVer">-</b></p>
+        </div>
+      </div>
+
+      <div class="dl-grid">
+        <!-- Windows -->
+        <div class="dl-card">
+          <div class="dl-card-head">
+            <div class="dl-os-icon win">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M0 3.449L9.75 2.1v9.451H0m10.949-9.602L24 0v11.4H10.949M0 12.6h9.75v9.451L0 20.699M10.949 12.6H24V24l-12.901-1.799"/></svg>
+            </div>
+            <div class="dl-head-meta">
+              <h4>Windows 客户端</h4>
+              <span class="muted">GUI 桌面版 / 服务后台</span>
+            </div>
+          </div>
+          <div class="dl-links">
+            <a id="dlWin64" class="btn primary" download>下载 64位 安装包 (.exe)</a>
+            <a id="dlWin32" class="btn" download>32位 版本</a>
+            <a id="dlWinArm64" class="btn" download>ARM64 版本</a>
+          </div>
+          <p class="hint">如 Windows Defender 弹出智能阻止提示，请点击「更多信息」并选择「仍要运行」。</p>
+        </div>
+
+        <!-- Linux -->
+        <div class="dl-card">
+          <div class="dl-card-head">
+            <div class="dl-os-icon linux">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M21.242 17.514c-.31-.806-1.045-1.34-1.848-1.515-.59-.129-1.205.083-1.683.473-.38.311-.75.768-1.056 1.253-.804-1.516-1.92-2.73-3.298-3.567 1.39-1.22 2.193-2.924 2.193-4.758 0-3.64-2.884-6.6-6.425-6.6-3.54 0-6.425 2.96-6.425 6.6 0 1.834.803 3.538 2.193 4.758-1.378.837-2.494 2.05-3.298 3.567-.306-.485-.676-.942-1.056-1.253-.478-.39-1.093-.602-1.683-.473-.803.175-1.538.709-1.848 1.515-.355.923-.198 1.968.41 2.766.72.946 1.874 1.488 3.09 1.488.243 0 .49-.021.737-.066.86-.157 1.637-.624 2.19-1.298 1.34 1.05 3.018 1.642 4.785 1.642 1.767 0 3.445-.592 4.785-1.642.553.674 1.33 1.141 2.19 1.298.247.045.494.066.737.066 1.216 0 2.37-.542 3.09-1.488.608-.798.765-1.843.41-2.766zM12.125 3.8c2.44 0 4.425 2.064 4.425 4.6 0 1.427-.645 2.748-1.744 3.606-.395.308-.636.772-.65 1.27-.014.498.198.975.578 1.306 1.087.948 1.815 2.215 2.112 3.655-.494-.094-1.002-.037-1.46.166-.462.204-.84.558-1.077 1.007-.803.352-1.696.54-2.61.54-.914 0-1.807-.188-2.61-.54-.237-.449-.615-.803-1.077-1.007-.458-.203-.966-.26-1.46-.166.297-1.44 1.025-2.707 2.112-3.655.38-.331.592-.808.578-1.306-.014-.498-.255-.962-.65-1.27-1.099-.858-1.744-2.179-1.744-3.606 0-2.536 1.985-4.6 4.425-4.6z"/></svg>
+            </div>
+            <div class="dl-head-meta">
+              <h4>Linux 客户端</h4>
+              <span class="muted">自动注册 systemd 服务开机自启</span>
+            </div>
+          </div>
+          <div class="cmd-list">
+            <div class="cmd-item">
+              <span class="cmd-tag">cURL 一键安装</span>
+              <div class="cmd-block">
+                <code id="dlLinuxCmd"></code>
+                <button class="btn copy-btn" data-copy="dlLinuxCmd">复制</button>
+              </div>
+            </div>
+            <div class="cmd-item">
+              <span class="cmd-tag">Wget 备用安装</span>
+              <div class="cmd-block">
+                <code id="dlWgetCmd"></code>
+                <button class="btn copy-btn" data-copy="dlWgetCmd">复制</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Docker -->
+        <div class="dl-card">
+          <div class="dl-card-head">
+            <div class="dl-os-icon docker">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.186.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.186.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.186.186.186m5.893 2.715h2.118a.186.186 0 00.186-.186V9.006a.186.186 0 00-.186-.186h-2.118a.186.186 0 00-.186.185v1.888c0 .102.082.185.186.185m-2.929 0h2.12a.185.185 0 00.184-.186V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.186V9.006a.185.185 0 00-.185-.186H5.136a.186.186 0 00-.186.185v1.888c0 .102.084.185.186.185m-2.928 0h2.119a.185.185 0 00.185-.186V9.006a.185.185 0 00-.185-.186H2.208a.186.186 0 00-.186.185v1.888c0 .102.084.185.186.185m21.644 1.458a7.876 7.876 0 00-4.041-3.666c-.309-.138-.636-.217-.968-.236l-.328-.014-.23.238c-.808.835-1.895 1.34-3.056 1.422H.857a.857.857 0 00-.857.858c0 2.21.677 4.34 1.947 6.134 1.765 2.494 4.544 4.024 7.545 4.156 5.86.257 11.233-3.153 13.565-8.318.368-.815.65-1.675.836-2.559.043-.2.062-.32.062-.32s-.044.17-.099.29z"/></svg>
+            </div>
+            <div class="dl-head-meta">
+              <h4>Docker 容器化运行</h4>
+              <span class="muted">适用于 NAS、群晖、软路由及容器环境</span>
+            </div>
+          </div>
+          <div class="cmd-list">
+            <div class="cmd-item">
+              <span class="cmd-tag">Docker 命令行一键运行</span>
+              <div class="cmd-block">
+                <code id="dlDockerCmd"></code>
+                <button class="btn copy-btn" data-copy="dlDockerCmd">复制</button>
+              </div>
+            </div>
+          </div>
+          <p class="hint">需开启 <code>--privileged</code> 与 <code>tun</code> 设备支持以建立虚拟通道。</p>
+        </div>
+
+        <!-- macOS -->
+        <div class="dl-card">
+          <div class="dl-card-head">
+            <div class="dl-os-icon mac">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 6.37c.61-.75 1.04-1.8 0.92-2.87-.9.04-2.02.6-2.66 1.34-.56.65-1.06 1.7-0.93 2.73.99.08 2.04-.45 2.67-1.2z"/></svg>
+            </div>
+            <div class="dl-head-meta">
+              <h4>macOS 终端安装</h4>
+              <span class="muted">兼容 Apple Silicon (M系列) 与 Intel</span>
+            </div>
+          </div>
+          <p class="hint">打开 macOS 终端执行以下指令完成自动安装：</p>
+          <div class="cmd-block">
+            <code id="dlMacCmd"></code>
+            <button class="btn copy-btn" data-copy="dlMacCmd">复制</button>
+          </div>
+        </div>
+
+        <!-- Android -->
+        <div class="dl-card">
+          <div class="dl-card-head">
+            <div class="dl-os-icon android">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M17.523 15.3414c-.5511 0-.9993-.4486-.9993-1.0007s.4482-1.0007.9993-1.0007c.5511 0 .9993.4486.9993 1.0007s-.4482 1.0007-.9993 1.0007m-11.046 0c-.5511 0-.9993-.4486-.9993-1.0007s.4482-1.0007.9993-1.0007c.5511 0 .9993.4486.9993 1.0007s-.4482 1.0007-.9993 1.0007m11.4045-6.02l1.9973-3.4592a.416.416 0 00-.1521-.5676.416.416 0 00-.5676.1521l-2.0223 3.503C15.5902 8.356 13.8533 8 12 8s-3.5902.356-5.1367.9497L4.841 5.4467a.4161.4161 0 00-.5677-.1521.4157.4157 0 00-.1521.5676l1.9973 3.4592C2.6889 11.1867.3432 14.6589 0 18.761h24c-.3432-4.1021-2.6889-7.5743-6.1185-9.4396"/></svg>
+            </div>
+            <div class="dl-head-meta">
+              <h4>Android 移动端</h4>
+              <span class="muted">APK 安装包下载</span>
+            </div>
+          </div>
+          <div class="dl-links">
+            <a id="dlAndroid" class="btn primary" download>下载 Android APK</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 新建/编辑转发规则弹窗 -->
+<dialog id="ruleDialog">
+  <form id="ruleForm" method="dialog">
+    <div class="dlg-head">
+      <h3 id="ruleDlgTitle">新建转发规则</h3>
+      <p class="muted">建立本端端口与对端主机服务之间的点对点或中继透传</p>
+    </div>
+    <label class="form-group">
+      <span class="label-text">规则名称</span>
+      <input id="ruAppName" class="input" placeholder="例如：rdp-desktop 或 web-service" required>
+    </label>
+    <div class="row2">
+      <label class="form-group">
+        <span class="label-text">所在设备（监听方）</span>
+        <select id="ruNode" class="input sel" required></select>
+      </label>
+      <label class="form-group">
+        <span class="label-text">本地监听端口</span>
+        <input id="ruSrcPort" class="input" type="number" min="1" max="65535" placeholder="1-65535" required>
+      </label>
+    </div>
+    <div class="row2">
+      <label class="form-group">
+        <span class="label-text">网络协议</span>
+        <select id="ruProto" class="input sel">
+          <option value="tcp">TCP 协议</option>
+          <option value="udp">UDP 协议</option>
+        </select>
+      </label>
+      <label class="form-group">
+        <span class="label-text">对端设备（目标所在节点）</span>
+        <select id="ruPeer" class="input sel" required></select>
+      </label>
+    </div>
+    <div class="row2">
+      <label class="form-group">
+        <span class="label-text">目标主机（对端视角的 IP/域名）</span>
+        <input id="ruDstHost" class="input" value="localhost" placeholder="localhost 或内网IP" required>
+      </label>
+      <label class="form-group">
+        <span class="label-text">目标端口</span>
+        <input id="ruDstPort" class="input" type="number" min="1" max="65535" placeholder="例如：3389 / 80" required>
+      </label>
+    </div>
+    <div id="ruleErr" class="err hidden"></div>
+    <div class="dlg-actions">
+      <button type="button" class="btn ghost" id="ruCancel">取消</button>
+      <button type="submit" class="btn primary" id="ruSave">保存并立即下发</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 批量加入成员弹窗 -->
+<dialog id="memberDialog">
+  <form id="memberForm" method="dialog">
+    <div class="dlg-head">
+      <h3>批量加入设备到虚拟网络</h3>
+      <p class="muted">勾选要加入的节点，确认后将自动分配虚拟 IP 并全量下发</p>
+    </div>
+    <div id="mdList" class="md-list"></div>
+    <div class="dlg-actions">
+      <button type="button" class="btn ghost" id="mdCancel">取消</button>
+      <button type="submit" class="btn primary">确认加入所选项</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 控制台设置与上游域名弹窗 -->
+<dialog id="settingsDialog">
+  <form id="settingsForm" method="dialog">
+    <div class="dlg-head">
+      <h3>控制台配置与官方上游域名</h3>
+      <p class="muted">配置面板反向代理的目标官方控制台。如果官方更换域名，在此修改即可全量生效。</p>
+    </div>
+    <label class="form-group">
+      <span class="label-text">官方控制台代理地址 (Upstream URL)</span>
+      <input id="setCurUpstream" class="input mono" placeholder="https://console.openpxp.com" required spellcheck="false">
+    </label>
+    <div class="preset-group">
+      <span class="muted" style="font-size:12px">常用预设：</span>
+      <button type="button" class="btn ghost btn-sm" data-upstream-set="https://console.openpxp.com">console.openpxp.com (官方默认)</button>
+      <button type="button" class="btn ghost btn-sm" data-upstream-set="https://console.openp2p.cn">console.openp2p.cn (国内镜像)</button>
+    </div>
+    <div id="settingsErr" class="err hidden"></div>
+    <div class="dlg-actions">
+      <button type="button" class="btn ghost" id="setCancel">取消</button>
+      <button type="submit" class="btn primary" id="setSave">保存设置</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 确认弹窗 -->
+<dialog id="confirmDialog">
+  <form method="dialog">
+    <div class="dlg-head">
+      <h3 id="cfTitle">操作确认</h3>
+      <p id="cfMsg" class="dialog-msg"></p>
+    </div>
+    <div class="dlg-actions">
+      <button value="cancel" class="btn ghost">取消</button>
+      <button value="ok" class="btn danger" id="cfOk">确认执行</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 悬浮 Toast 消息 -->
+<div id="toast" class="hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

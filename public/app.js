@@ -1,0 +1,1061 @@
+/* OpenP2P 管理面板前端 — 原生 JS，无构建步骤 */
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const API = "/pxp"; // 反向代理前缀
+
+/* ---------------- 状态 ---------------- */
+const state = {
+  devices: [],
+  latestVer: "",
+  sdwan: null,
+  tunnelByNode: {},   // node -> Apps[]
+  memApps: [],        // 当前查看成员的组网隧道明细
+  profile: null,      // 含 installToken
+  user: "",
+  upstream: "https://console.openpxp.com",
+  accounts: [],       // 多账户列表（服务端 /api/state）
+  selView: "devices",
+};
+
+/* ---------------- 基础工具 ---------------- */
+function toast(msg, type = "") {
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = type;
+  el.classList.remove("hidden");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.add("hidden"), type === "err" ? 6000 : 3000);
+}
+
+async function pxp(path, opts = {}) {
+  const headers = opts.body ? { "Content-Type": "application/json" } : {};
+  const key = localStorage.getItem("panelKey");
+  if (key) headers["X-Panel-Key"] = key;
+  const rsp = await fetch(API + path, {
+    method: opts.method || "GET",
+    headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const text = await rsp.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (rsp.status === 401) {
+    // 访问口令缺失/错误：提示并让用户重新输入
+    const key2 = prompt("本面板已启用访问口令，请输入：");
+    if (key2) {
+      localStorage.setItem("panelKey", key2);
+      location.reload();
+    }
+  }
+  return { status: rsp.status, data };
+}
+
+/** push 指令：默认 rsp=0（不阻塞等待回执），随后由调用方轮询确认 */
+function pushCmd(node, subtype, body, rsp = 0) {
+  const q = `subtype=${subtype}&rsp=${rsp}&edgeserver=`;
+  return pxp(`/api/v1/device/${encodeURIComponent(node)}/push?${q}`, { method: "POST", body: body || {} });
+}
+
+function fmtTime(s) { return s ? String(s).replace("T", " ").slice(0, 19) : "-"; }
+function onlineDev(d) { return d.isActive === 1; }
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/** IP 等可复制值：文本 + 小复制按钮 */
+function copyBtn(value, cls = "") {
+  const v = String(value ?? "").trim();
+  if (!v || v === "-") return `<span class="muted">-</span>`;
+  return `<span class="copyable ${cls}"><span class="copy-text">${esc(v)}</span>` +
+    `<button class="copy-mini" data-copy-text="${esc(v)}" title="复制">⧉</button></span>`;
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`已复制 ${text}`, "ok");
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+    toast(`已复制 ${text}`, "ok");
+  }
+}
+
+function confirmDlg(title, msg) {
+  return new Promise((resolve) => {
+    $("cfTitle").textContent = title;
+    $("cfMsg").textContent = msg;
+    const dlg = $("confirmDialog");
+    dlg.onclose = () => resolve(dlg.returnValue === "ok");
+    dlg.showModal();
+  });
+}
+
+/* ---------------- 登录 / 会话 ---------------- */
+async function checkState() {
+  try {
+    const headers = {};
+    const key = localStorage.getItem("panelKey");
+    if (key) headers["X-Panel-Key"] = key;
+    const rsp = await fetch("/api/state", { headers });
+    if (rsp.status === 401) {
+      const key2 = prompt("本面板已启用访问口令，请输入：");
+      if (key2) {
+        localStorage.setItem("panelKey", key2);
+        location.reload();
+      }
+      return false;
+    }
+    const st = await rsp.json();
+    state.accounts = st.accounts || [];
+    state.upstream = st.upstream || "https://console.openpxp.com";
+    if ($("loginUpstream")) $("loginUpstream").value = state.upstream;
+    if ($("setCurUpstream")) $("setCurUpstream").value = state.upstream;
+    if (st.hasToken && (!st.tokenExp || st.tokenExp * 1000 > Date.now())) {
+      state.user = st.user;
+      return true;
+    }
+  } catch (e) { /* server down */ }
+  return false;
+}
+
+/* ---------------- 登录页：双模式 + 验证码 + 上游地址 ---------------- */
+let loginMode = "password";
+let captchaId = "";
+
+document.querySelectorAll("[data-upstream]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    if ($("loginUpstream")) $("loginUpstream").value = btn.dataset.upstream;
+  });
+});
+
+async function reloadCaptcha() {
+  try {
+    const headers = { "Content-Type": "application/json", "X-Panel-Theme": document.documentElement.dataset.theme || "dark" };
+    const key = localStorage.getItem("panelKey");
+    if (key) headers["X-Panel-Key"] = key;
+    const rsp = await fetch("/api/captcha", { method: "POST", headers });
+    const data = await rsp.json();
+    captchaId = data.captchaId || "";
+    $("captchaImg").src = data.svg || "";
+    $("loginCaptcha").value = "";
+  } catch (e) {
+    $("captchaImg").alt = "验证码加载失败";
+  }
+}
+
+document.querySelectorAll(".seg-btn").forEach((btn) =>
+  btn.addEventListener("click", () => {
+    loginMode = btn.dataset.mode;
+    document.querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    $("modePassword").classList.toggle("hidden", loginMode !== "password");
+    $("modeToken").classList.toggle("hidden", loginMode !== "token");
+    $("loginErr").classList.add("hidden");
+    reloadCaptcha();
+  })
+);
+
+$("captchaImg").addEventListener("click", reloadCaptcha);
+
+$("loginForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("loginErr").classList.add("hidden");
+  const captcha = $("loginCaptcha").value.trim();
+  if (!captcha) {
+    $("loginErr").textContent = "请输入验证码";
+    $("loginErr").classList.remove("hidden");
+    return;
+  }
+  const headers = { "Content-Type": "application/json" };
+  const key = localStorage.getItem("panelKey");
+  if (key) headers["X-Panel-Key"] = key;
+  const url = loginMode === "password" ? "/api/login" : "/api/login-token";
+  const upstream = $("loginUpstream") ? $("loginUpstream").value.trim() : "";
+  const body = loginMode === "password"
+    ? {
+        user: $("loginUser").value.trim(),
+        password: $("loginPass").value,
+        remember: $("loginRemember").checked,
+        captchaId,
+        captcha,
+        upstream,
+      }
+    : { token: $("loginToken").value.trim(), captchaId, captcha, upstream };
+  if (loginMode === "password" && (!$("loginUser").value.trim() || !$("loginPass").value)) {
+    $("loginErr").textContent = "请输入用户名和密码";
+    $("loginErr").classList.remove("hidden");
+    return;
+  }
+  if (loginMode === "token" && !$("loginToken").value.trim()) {
+    $("loginErr").textContent = "请粘贴官方控制台的 token";
+    $("loginErr").classList.remove("hidden");
+    return;
+  }
+  const rsp = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const data = await rsp.json();
+  if (data.error === 0) {
+    state.user = loginMode === "password" ? $("loginUser").value.trim() : (data.user || "");
+    // 登录成功后刷新账户列表（新账户已入池）
+    try {
+      const st = await (await fetch("/api/state", { headers: panelHeaders() })).json();
+      state.accounts = st.accounts || [];
+    } catch {}
+    enterMain();
+  } else {
+    $("loginErr").textContent = "登录失败: " + (data.detail || data.error);
+    $("loginErr").classList.remove("hidden");
+    reloadCaptcha(); // 验证码单次有效，失败后必须换新的
+  }
+});
+
+$("btnLogout").addEventListener("click", async () => {
+  const headers = { method: "POST" };
+  const key = localStorage.getItem("panelKey");
+  if (key) headers.headers = { "X-Panel-Key": key };
+  await fetch("/api/logout", headers);
+  location.reload();
+});
+
+async function enterMain() {
+  $("loginView").classList.add("hidden");
+  $("mainView").classList.remove("hidden");
+  $("connState").textContent = "已连接";
+  $("connState").className = "badge on";
+  $("userInfo").textContent = state.user || "";
+  renderAcctMenu(state.accounts || []);
+  await refreshAll();
+}
+
+/* ---------------- 多账户切换 ---------------- */
+function renderAcctMenu(accounts) {
+  const menu = $("acctMenu");
+  if (!accounts.length) {
+    menu.innerHTML = `<div class="acct-empty">尚无账户</div>`;
+    return;
+  }
+  menu.innerHTML = accounts.map((a) => {
+    const exp = a.tokenExp ? new Date(a.tokenExp * 1000).toLocaleDateString() : "无凭据";
+    return `<button class="acct-item ${a.active ? "current" : ""}" data-user="${esc(a.user)}" data-active="${a.active ? 1 : 0}">
+      <span class="name">${esc(a.user)}</span>
+      <span class="meta">${a.hasToken ? "有效期至 " + exp : "未登录"}${a.hasPassword ? " · 密码✓" : ""}</span>
+      ${a.active ? "" : '<span class="rm" data-rm="' + esc(a.user) + '" title="移除该账户">✕</span>'}
+    </button>`;
+  }).join("") + `<div class="acct-sep"></div><button class="acct-add" data-add="1">＋ 添加账户</button>`;
+}
+
+$("btnAcct").addEventListener("click", async () => {
+  const menu = $("acctMenu");
+  if (menu.classList.contains("hidden")) {
+    const st = await (await fetch("/api/state", { headers: panelHeaders() })).json();
+    state.accounts = st.accounts || [];
+    renderAcctMenu(state.accounts);
+    menu.classList.remove("hidden");
+  } else {
+    menu.classList.add("hidden");
+  }
+});
+
+document.addEventListener("click", async (ev) => {
+  const menu = $("acctMenu");
+  if (!menu || menu.classList.contains("hidden")) return;
+  // 点在菜单外则收起（菜单内部动作自行处理后再收起）
+  const rm = ev.target.closest(".rm[data-rm]");
+  if (rm) {
+    ev.stopPropagation();
+    const user = rm.dataset.rm;
+    if (!(await confirmDlg("移除账户", `将从面板移除账户「${user}」的本地凭据（不影响官方账号本身）。继续？`))) return;
+    const rsp = await pxp2("/api/accounts/remove", { user });
+    if (rsp.error === 0) {
+      toast(`已移除 ${user}`);
+      menu.classList.add("hidden");
+      const st = await (await fetch("/api/state", { headers: panelHeaders() })).json();
+      if (st.hasToken) {
+        state.user = st.user;
+        $("userInfo").textContent = st.user;
+        await refreshAll();
+      } else {
+        location.reload();
+      }
+    } else {
+      toast(rsp.detail || "移除失败", "err");
+    }
+    return;
+  }
+  const add = ev.target.closest(".acct-add");
+  if (add) {
+    menu.classList.add("hidden");
+    $("loginView").classList.remove("hidden");
+    $("loginErr").classList.add("hidden");
+    await reloadCaptcha();
+    return;
+  }
+  const item = ev.target.closest(".acct-item[data-user]");
+  if (item && item.dataset.active !== "1") {
+    const rsp = await pxp2("/api/accounts/switch", { user: item.dataset.user });
+    if (rsp.error === 0) {
+      menu.classList.add("hidden");
+      toast(`已切换到 ${rsp.user}`, "ok");
+      state.user = rsp.user;
+      $("userInfo").textContent = rsp.user;
+      await refreshAll();
+    } else {
+      toast(rsp.detail || "切换失败", "err");
+    }
+    return;
+  }
+  // 点击菜单空白处不关闭
+  if (ev.target.closest(".acct-menu")) return;
+  if (!ev.target.closest(".acct-wrap")) menu.classList.add("hidden");
+});
+
+function panelHeaders(extra = {}) {
+  const h = { ...extra };
+  const key = localStorage.getItem("panelKey");
+  if (key) h["X-Panel-Key"] = key;
+  return h;
+}
+
+async function pxp2(path, body) {
+  const rsp = await fetch(path, {
+    method: "POST",
+    headers: panelHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  return rsp.json();
+}
+
+/* ---------------- 数据加载 ---------------- */
+async function refreshAll() {
+  try {
+    const [devs, sdw, prof] = await Promise.all([
+      pxp("/api/v1/devices"),
+      pxp("/api/v1/sdwans/"),
+      pxp("/api/v1/user/profile", { method: "POST", body: {} }),
+    ]);
+    if (devs.status === 200 && devs.data.nodes) {
+      state.devices = devs.data.nodes;
+      state.latestVer = devs.data.latestVer || "";
+    } else {
+      toast("设备列表拉取失败: " + JSON.stringify(devs.data).slice(0, 120), "err");
+    }
+    state.sdwan = sdw.status === 200 && sdw.data.Nodes ? sdw.data : null;
+    if (prof.status === 200 && prof.data.profile) state.profile = prof.data.profile;
+    renderDevices();
+    renderNetwork();
+    renderDownload();
+    await refreshTunnels(true);
+  } catch (e) {
+    toast("网络错误: " + e, "err");
+  }
+}
+
+/** 并发拉取所有在线设备的规则列表（MsgPushReportApps=7） */
+async function refreshTunnels(quiet = false) {
+  const online = state.devices.filter(onlineDev);
+  if (!quiet) toast(`正在拉取 ${online.length} 台在线设备的规则…`);
+  const results = await Promise.allSettled(online.map((d) => pushCmd(d.name, 7, {}, 1)));
+  const map = {};
+  for (const d of state.devices) map[d.name] = map[d.name] || [];
+  for (let i = 0; i < online.length; i++) {
+    const r = results[i];
+    if (r.status === "fulfilled" && r.value.status === 200 && Array.isArray(r.value.data.Apps)) {
+      map[online[i].name] = r.value.data.Apps;
+    }
+  }
+  state.tunnelByNode = map;
+  renderTunnels();
+  if (!quiet) toast("规则已刷新");
+}
+
+function renderOsTag(osStr, devName) {
+  const os = String(osStr || "").toLowerCase();
+  const name = String(devName || "").toLowerCase();
+  const combo = `${os} ${name}`;
+  let cls = "";
+  let iconSvg = "";
+
+  // 1. Docker
+  if (combo.includes("docker")) {
+    cls = "docker";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.186.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.186.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.186.186.186m5.893 2.715h2.118a.186.186 0 00.186-.186V9.006a.186.186 0 00-.186-.186h-2.118a.186.186 0 00-.186.185v1.888c0 .102.082.185.186.185m-2.929 0h2.12a.185.185 0 00.184-.186V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.186V9.006a.185.185 0 00-.185-.186H5.136a.186.186 0 00-.186.185v1.888c0 .102.084.185.186.185m-2.928 0h2.119a.185.185 0 00.185-.186V9.006a.185.185 0 00-.185-.186H2.208a.186.186 0 00-.186.185v1.888c0 .102.084.185.186.185m21.644 1.458a7.876 7.876 0 00-4.041-3.666c-.309-.138-.636-.217-.968-.236l-.328-.014-.23.238c-.808.835-1.895 1.34-3.056 1.422H.857a.857.857 0 00-.857.858c0 2.21.677 4.34 1.947 6.134 1.765 2.494 4.544 4.024 7.545 4.156 5.86.257 11.233-3.153 13.565-8.318.368-.815.65-1.675.836-2.559.043-.2.062-.32.062-.32s-.044.17-.099.29z"/></svg>`;
+  }
+  // 2. Android
+  else if (os.includes("android")) {
+    cls = "android";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.523 15.3414c-.5511 0-.9993-.4486-.9993-1.0007s.4482-1.0007.9993-1.0007c.5511 0 .9993.4486.9993 1.0007s-.4482 1.0007-.9993 1.0007m-11.046 0c-.5511 0-.9993-.4486-.9993-1.0007s.4482-1.0007.9993-1.0007c.5511 0 .9993.4486.9993 1.0007s-.4482 1.0007-.9993 1.0007m11.4045-6.02l1.9973-3.4592a.416.416 0 00-.1521-.5676.416.416 0 00-.5676.1521l-2.0223 3.503C15.5902 8.356 13.8533 8 12 8s-3.5902.356-5.1367.9497L4.841 5.4467a.4161.4161 0 00-.5677-.1521.4157.4157 0 00-.1521.5676l1.9973 3.4592C2.6889 11.1867.3432 14.6589 0 18.761h24c-.3432-4.1021-2.6889-7.5743-6.1185-9.4396"/></svg>`;
+  }
+  // 3. Apple / macOS / iOS
+  else if (os.includes("darwin") || os.includes("mac") || os.includes("apple") || os.includes("ios")) {
+    cls = "mac";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 6.37c.61-.75 1.04-1.8 0.92-2.87-.9.04-2.02.6-2.66 1.34-.56.65-1.06 1.7-0.93 2.73.99.08 2.04-.45 2.67-1.2z"/></svg>`;
+  }
+  // 4. Windows
+  else if (os.includes("windows") || os.includes("win")) {
+    cls = "win";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M0 3.449L9.75 2.1v9.451H0m10.949-9.602L24 0v11.4H10.949M0 12.6h9.75v9.451L0 20.699M10.949 12.6H24V24l-12.901-1.799"/></svg>`;
+  }
+  // 5. Synology / NAS / 存储
+  else if (os.includes("synology") || os.includes("dsm") || os.includes("qnap") || combo.includes("nas")) {
+    cls = "nas";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>`;
+  }
+  // 6. Ubuntu (如 Ubuntu 22.04.5 LTS)
+  else if (combo.includes("ubuntu")) {
+    cls = "ubuntu";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm.012 3.82c1.472 0 2.665 1.193 2.665 2.665 0 1.472-1.193 2.665-2.665 2.665-1.472 0-2.665-1.193-2.665-2.665 0-1.472 1.193-2.665 2.665-2.665zm-6.19 5.35c.895 0 1.62.726 1.62 1.62 0 .895-.725 1.62-1.62 1.62-.894 0-1.62-.725-1.62-1.62 0-.894.726-1.62 1.62-1.62zm12.38 0c.894 0 1.62.726 1.62 1.62 0 .895-.726 1.62-1.62 1.62-.895 0-1.62-.725-1.62-1.62 0-.894.725-1.62 1.62-1.62zM12.012 9.9c2.18 0 4.07 1.16 5.12 2.89-.5.36-.88.89-1.07 1.5-.78-.96-1.95-1.58-3.28-1.58-.93 0-1.79.3-2.49.81l-1.45-1.45c.87-.71 1.98-1.17 3.17-1.17zm-5.06 2.05l1.45 1.45c-.37.53-.59 1.18-.59 1.88 0 .62.18 1.2.49 1.69l-1.47 1.47c-.77-.87-1.25-2-1.25-3.25 0-1.28.51-2.43 1.37-3.24zm10.12 0c.86.81 1.37 1.96 1.37 3.24 0 1.25-.48 2.38-1.25 3.25l-1.47-1.47c.31-.49.49-1.07.49-1.69 0-.7-.22-1.35-.59-1.88zm-5.06 3.65c1.33 0 2.5.62 3.28 1.58.19.61.57 1.14 1.07 1.5-1.05 1.73-2.94 2.89-5.12 2.89-1.19 0-2.3-.46-3.17-1.17l1.45-1.45c.7.51 1.56.81 2.49.81z"/></svg>`;
+  }
+  // 7. Debian
+  else if (combo.includes("debian")) {
+    cls = "debian";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12.04 0C5.4 0 .04 5.37.04 12c0 6.64 5.36 12 12 12 6.63 0 12-5.36 12-12C24.04 5.37 18.67 0 12.04 0zm.06 1.88c5.6 0 10.13 4.53 10.13 10.12 0 5.6-4.53 10.13-10.13 10.13-5.59 0-10.12-4.53-10.12-10.13 0-5.59 4.53-10.12 10.12-10.12zm.88 2.38c-3.1 0-5.7 1.6-6.66 4.06-.95 2.47-.42 5.32 1.38 7.22 1.8 1.88 4.6 2.4 7.06 1.38.7-.28 1.3-.72 1.78-1.25-.52-.16-1.02-.4-1.47-.75-.4-.3-.72-.7-.94-1.12-.5.5-.9 1.1-1.7.9-1.4-.3-2.1-1.8-1.5-3 .5-1.1 1.7-1.7 2.8-1.5 1 .2 1.7 1 1.8 2 .1.4.1.8 0 1.2.6.2 1.2.2 1.7 0 .8-.4 1.3-1.1 1.5-1.9.4-1.6-.3-3.2-1.6-4.2-1.2-1-2.8-1.4-4.3-1.02z"/></svg>`;
+  }
+  // 8. Alpine Linux
+  else if (combo.includes("alpine")) {
+    cls = "alpine";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12.003 3.652a1.05 1.05 0 0 0-.909.527l-5.6 9.695a1.05 1.05 0 0 0 .909 1.575h11.2a1.05 1.05 0 0 0 .91-1.575l-5.6-9.695a1.05 1.05 0 0 0-.91-.527zm-5.46 9.447l4.13-7.152 2.65 4.59-1.55 2.562H6.543zm6.65-2.062l1.66 2.062h-3.32l1.66-2.062z"/></svg>`;
+  }
+  // 9. OpenWrt / 软路由 / LEDE / 爱快
+  else if (combo.includes("openwrt") || combo.includes("lede") || combo.includes("router") || combo.includes("ikuai") || combo.includes("istore")) {
+    cls = "router";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 18h.01M10 18h.01"/><path d="M5 14V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v8"/><path d="M12 4v4"/></svg>`;
+  }
+  // 10. CentOS / RedHat / Fedora / Rocky / AlmaLinux
+  else if (combo.includes("centos") || combo.includes("redhat") || combo.includes("rhel") || combo.includes("fedora") || combo.includes("rocky") || combo.includes("alma")) {
+    cls = "centos";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3.5v4.25l3.5-3.5zm1.5.75l3.5 3.5H12.75zm5.75 3.5l-3.5 3.5h4.25zm-.75 1.5h-4.25v4.25zm-3.5 5.75l3.5 3.5V14.25zm-1.5-.75v4.25H12zm-5.75-3.5l3.5-3.5H3.5zm.75-1.5h4.25V8.25zm3.5-5.75L4.75 4.75V9zm1.5.75V4.25H12z"/></svg>`;
+  }
+  // 11. Arch / Manjaro
+  else if (combo.includes("arch") || combo.includes("manjaro")) {
+    cls = "arch";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5L2.5 21.5h4.2l2.3-5.2c.7.3 1.6.5 2.5.5s1.8-.2 2.5-.5l2.3 5.2h4.2L12 2.5zm0 8.2l2 4.6c-.6.2-1.3.3-2 .3s-1.4-.1-2-.3l2-4.6z"/></svg>`;
+  }
+  // 12. Raspberry Pi / 树莓派 / Armbian
+  else if (combo.includes("raspberry") || combo.includes("raspbian") || combo.includes("armbian")) {
+    cls = "rpi";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a3 3 0 0 0-3 3c0 .35.07.68.18.98A4.5 4.5 0 0 0 7 9.5c0 1.25.5 2.38 1.32 3.2A4.98 4.98 0 0 0 8 15c0 2.76 2.24 5 5 5s5-2.24 5-5c0-.82-.2-1.59-.55-2.27.79-.82 1.28-1.93 1.28-3.16 0-1.63-.87-3.06-2.18-3.85.11-.3.18-.63.18-.98a3 3 0 0 0-3-3c-.92 0-1.74.42-2.28 1.07A3.01 3.01 0 0 0 12 2z"/></svg>`;
+  }
+  // 13. 通用 Linux 或其它 Linux 发行版（SUSE、Gentoo、Mint、Kali、Kylin、Deepin、UOS 等）
+  else if (
+    combo.includes("linux") ||
+    combo.includes("unix") ||
+    combo.includes("gnu") ||
+    combo.includes("bsd") ||
+    combo.includes("posix") ||
+    combo.includes("suse") ||
+    combo.includes("gentoo") ||
+    combo.includes("mint") ||
+    combo.includes("kali") ||
+    combo.includes("deepin") ||
+    combo.includes("uos") ||
+    combo.includes("kylin") ||
+    combo.includes("opencloudos") ||
+    combo.includes("tencentos")
+  ) {
+    cls = "linux";
+    iconSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M21.242 17.514c-.31-.806-1.045-1.34-1.848-1.515-.59-.129-1.205.083-1.683.473-.38.311-.75.768-1.056 1.253-.804-1.516-1.92-2.73-3.298-3.567 1.39-1.22 2.193-2.924 2.193-4.758 0-3.64-2.884-6.6-6.425-6.6-3.54 0-6.425 2.96-6.425 6.6 0 1.834.803 3.538 2.193 4.758-1.378.837-2.494 2.05-3.298 3.567-.306-.485-.676-.942-1.056-1.253-.478-.39-1.093-.602-1.683-.473-.803.175-1.538.709-1.848 1.515-.355.923-.198 1.968.41 2.766.72.946 1.874 1.488 3.09 1.488.243 0 .49-.021.737-.066.86-.157 1.637-.624 2.19-1.298 1.34 1.05 3.018 1.642 4.785 1.642 1.767 0 3.445-.592 4.785-1.642.553.674 1.33 1.141 2.19 1.298.247.045.494.066.737.066 1.216 0 2.37-.542 3.09-1.488.608-.798.765-1.843.41-2.766zM12.125 3.8c2.44 0 4.425 2.064 4.425 4.6 0 1.427-.645 2.748-1.744 3.606-.395.308-.636.772-.65 1.27-.014.498.198.975.578 1.306 1.087.948 1.815 2.215 2.112 3.655-.494-.094-1.002-.037-1.46.166-.462.204-.84.558-1.077 1.007-.803.352-1.696.54-2.61.54-.914 0-1.807-.188-2.61-.54-.237-.449-.615-.803-1.077-1.007-.458-.203-.966-.26-1.46-.166.297-1.44 1.025-2.707 2.112-3.655.38-.331.592-.808.578-1.306-.014-.498-.255-.962-.65-1.27-1.099-.858-1.744-2.179-1.744-3.606 0-2.536 1.985-4.6 4.425-4.6z"/></svg>`;
+  }
+
+  const rawOs = String(osStr || "").trim();
+  let labelText = rawOs || "-";
+  if (cls === "docker" && !os.includes("docker")) {
+    labelText = `${rawOs || "linux"} (docker)`;
+  }
+  return `<span class="tag os ${cls}">${iconSvg}${esc(labelText)}</span>`;
+}
+
+/* ---------------- 设备总览 ---------------- */
+function renderDevices() {
+  const total = state.devices.length;
+  const onlineCount = state.devices.filter(onlineDev).length;
+  const offlineCount = total - onlineCount;
+  if ($("statTotalDev")) $("statTotalDev").textContent = total;
+  if ($("statOnlineDev")) $("statOnlineDev").textContent = onlineCount;
+  if ($("statOfflineDev")) $("statOfflineDev").textContent = offlineCount;
+
+  const kw = $("devSearch").value.trim().toLowerCase();
+  const onlyOnline = $("devOnlyOnline").checked;
+  const list = state.devices.filter((d) => {
+    if (onlyOnline && !onlineDev(d)) return false;
+    if (!kw) return true;
+    return [d.name, d.ip, d.lanip, d.os].join(" ").toLowerCase().includes(kw);
+  });
+  const tbody = $("devTable").querySelector("tbody");
+  tbody.innerHTML = list.map((d) => {
+    const on = onlineDev(d);
+    const upd = d.version !== state.latestVer && state.latestVer;
+    return `<tr data-node="${esc(d.name)}">
+      <td><input type="checkbox" class="dev-chk" data-node="${esc(d.name)}"></td>
+      <td><span class="dot ${on ? "on" : "off"}"></span>${on ? "在线" : "离线"}</td>
+      <td class="name">${esc(d.name)}</td>
+      <td class="ip">${copyBtn(d.lanip)}</td>
+      <td class="ip">${copyBtn(d.ip)}</td>
+      <td>${renderOsTag(d.os, d.name)}</td>
+      <td><span class="tag">NAT${esc(d.natType ?? "-")}</span></td>
+      <td>${esc(d.version || "-")}${upd ? ` <a class="tag" style="color:var(--amber)">可升级</a>` : ""}</td>
+      <td>${esc(d.bandwidth ?? "-")}</td>
+      <td>${esc(fmtTime(d.activetime))}</td>
+      <td class="op">
+        <button class="btn" data-act="tunnels">规则</button>
+        <button class="btn" data-act="restart">重启</button>
+        <button class="btn" data-act="upgrade" ${upd ? "" : "disabled"}>升级</button>
+        <button class="btn danger" data-act="delete">删除</button>
+      </td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="11" class="muted" style="text-align:center">无设备</td></tr>`;
+  updateBatchButtons();
+}
+
+function updateBatchButtons() {
+  const n = document.querySelectorAll(".dev-chk:checked").length;
+  for (const [id, label] of [["btnBatchRestart", "⚡ 重启所选"], ["btnBatchUpgrade", "⬆ 升级所选"], ["btnBatchDelete", "🗑 删除所选"]]) {
+    const b = $(id);
+    b.disabled = n === 0;
+    b.textContent = n ? `${label} (${n})` : label;
+  }
+}
+
+/** 从账号移除设备（官方同款接口，设备端需在线接受卸载推送） */
+async function doDeleteDevices(nodes) {
+  const offline = nodes.filter((n) => { const d = state.devices.find((x) => x.name === n); return d && !onlineDev(d); });
+  const msg = `将从账号移除 ${nodes.length} 台设备：${nodes.join("、")}。` +
+    (offline.length ? `\n⚠️ 其中 ${offline.length} 台当前离线，离线设备可能无法响应移除指令，需重新上线后处理。` : "") +
+    `\n此操作不可撤销（需在设备上重装客户端才能重新加入）。继续？`;
+  if (!(await confirmDlg("批量删除设备", msg))) return;
+  let ok = 0, fail = 0;
+  for (const n of nodes) {
+    try {
+      const rsp = await pxp(`/api/v1/device/${encodeURIComponent(n)}/delete`);
+      (rsp.status === 200 && rsp.data.error === 0) ? ok++ : fail++;
+    } catch { fail++; }
+  }
+  toast(`删除完成：成功 ${ok} 台${fail ? `，失败 ${fail} 台` : ""}`, fail ? "err" : "ok");
+  await refreshAll();
+}
+
+async function doRestart(nodes) {
+  if (!(await confirmDlg("重启设备", `将对 ${nodes.length} 台设备下发重启指令，期间其转发/组网会短暂中断。继续？`))) return;
+  for (const n of nodes) await pushCmd(n, 11, {});
+  toast(`已向 ${nodes.length} 台设备下发重启指令`);
+}
+
+async function doUpgrade(nodes) {
+  if (!(await confirmDlg("升级设备", `将对 ${nodes.length} 台设备下发升级指令（目标版本 ${state.latestVer}）。继续？`))) return;
+  for (const n of nodes) await pushCmd(n, 6, {});
+  toast(`已向 ${nodes.length} 台设备下发升级指令`);
+}
+
+$("devSearch").addEventListener("input", renderDevices);
+$("devOnlyOnline").addEventListener("change", renderDevices);
+$("devChkAll").addEventListener("change", (ev) => {
+  document.querySelectorAll(".dev-chk").forEach((c) => (c.checked = ev.target.checked));
+  updateBatchButtons();
+});
+$("devTable").addEventListener("click", (ev) => {
+  const chk = ev.target.closest(".dev-chk");
+  if (chk) { updateBatchButtons(); return; }
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn) return;
+  const node = btn.closest("tr").dataset.node;
+  const act = btn.dataset.act;
+  if (act === "tunnels") {
+    switchView("tunnels");
+    $("tlNodeFilter").value = node;
+    renderTunnels();
+  } else if (act === "restart") doRestart([node]);
+  else if (act === "upgrade") doUpgrade([node]);
+  else if (act === "delete") doDeleteDevices([node]);
+});
+$("btnBatchRestart").addEventListener("click", () => doRestart(selNodes()));
+$("btnBatchUpgrade").addEventListener("click", () => doUpgrade(selNodes()));
+$("btnBatchDelete").addEventListener("click", () => doDeleteDevices(selNodes()));
+function selNodes() {
+  return [...document.querySelectorAll(".dev-chk:checked")].map((c) => c.dataset.node);
+}
+
+/* ---------------- 隧道规则 ---------------- */
+function ruleType(rule) {
+  return rule.srcPort ? "pf" : "sd"; // 有监听端口 = 端口转发，否则为组网隧道
+}
+
+function renderTunnels() {
+  const nodeFilter = $("tlNodeFilter").value || "";
+  const kw = $("tlSearch").value.trim().toLowerCase();
+  const showPf = $("tlTypePf").checked;
+  const showSd = $("tlTypeSd").checked;
+
+  const sel = $("tlNodeFilter");
+  const cur = sel.value;
+  sel.innerHTML = `<option value="">全部设备</option>` +
+    state.devices.map((d) => `<option value="${esc(d.name)}">${esc(d.name)}</option>`).join("");
+  sel.value = cur;
+
+  const rows = [];
+  for (const [node, apps] of Object.entries(state.tunnelByNode)) {
+    if (nodeFilter && node !== nodeFilter) continue;
+    for (const a of apps) {
+      const t = ruleType(a);
+      if (t === "pf" && !showPf) continue;
+      if (t === "sd" && !showSd) continue;
+      if (kw) {
+        const hay = [a.appName, a.peerNode, a.dstHost, a.relayNode, a.specRelayNode, a.linkMode].join(" ").toLowerCase();
+        if (!hay.includes(kw)) continue;
+      }
+      rows.push({ node, a, t });
+    }
+  }
+
+  const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
+  // 连接状态四态推导（字段语义来自实测：isActive=1 已连接；connectTime 为 0001-01-01 零值表示从未连上）
+  const ZERO_TIME = "0001-01-01";
+  const connStateOf = (a) => {
+    if (a.enabled === 0) return { txt: "已停用", cls: "cs-off" };
+    if (a.isActive === 1) return { txt: "✅ 已连接", cls: "cs-ok" };
+    const never = !a.connectTime || String(a.connectTime).startsWith(ZERO_TIME);
+    const peerDev = devMap[a.peerNode];
+    if (peerDev && !onlineDev(peerDev)) return { txt: "等待对端上线", cls: "cs-wait" };
+    if (never) return { txt: "正在连接…", cls: "cs-wait" };
+    return { txt: "重试中", cls: "cs-wait" };
+  };
+  $("tlSummary").textContent = `共 ${rows.length} 条`;
+
+  let activeCount = 0;
+  for (const apps of Object.values(state.tunnelByNode)) {
+    for (const a of apps) {
+      if (a.isActive === 1) activeCount++;
+    }
+  }
+  if ($("statActiveTunnels")) $("statActiveTunnels").textContent = activeCount;
+
+  const tbody = $("tlTable").querySelector("tbody");
+  tbody.innerHTML = rows.map(({ node, a, t }) => {
+    const dev = devMap[node];
+    const relay = a.specRelayNode
+      ? `${esc(a.specRelayNode)}${a.relayNode && a.relayNode !== a.specRelayNode ? ` (实际:${esc(a.relayNode)})` : ""}`
+      : (a.relayNode ? `<span class="muted">自动:</span> ${esc(a.relayNode)}` : `<span class="muted">P2P 直连</span>`);
+    const cs = connStateOf(a);
+    const peerDev = devMap[a.peerNode];
+    return `<tr>
+      <td>${esc(node)}${dev && !onlineDev(dev) ? ' <span class="tag">离线</span>' : ""}</td>
+      <td class="name">${esc(a.appName)}</td>
+      <td><span class="tag ${t === "pf" ? "pf" : "sd"}">${t === "pf" ? "端口转发" : "组网隧道"}</span></td>
+      <td>${t === "pf" ? `<b class="ip">${esc(a.protocol || "tcp")}:${esc(a.srcPort)}</b>` : "-"}</td>
+      <td>${esc(a.peerNode || "-")}${peerDev && !onlineDev(peerDev) ? ' <span class="tag">对端离线</span>' : ""}</td>
+      <td>${t === "pf" ? `${esc(a.dstHost || "localhost")}:${esc(a.dstPort)}` : "-"}</td>
+      <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
+      <td class="relay">${relay}</td>
+      <td class="${cs.cls}">${cs.txt}</td>
+      <td>${a.enabled === 0 ? `<a class="tag" style="color:var(--danger)">停用</a>` : "✅"}</td>
+      <td class="op">
+        <button class="btn" data-act="toggle" data-node="${esc(node)}" data-app="${esc(a.appName)}"
+          data-pf="${esc(a.protocol || "")}" data-port="${esc(a.srcPort || 0)}" data-peer="${esc(a.peerNode || "")}"
+          data-en="${a.enabled === 0 ? 1 : 0}">${a.enabled === 0 ? "启用" : "停用"}</button>
+        ${t === "pf" ? `<button class="btn" data-act="edit" data-node="${esc(node)}" data-app="${esc(a.appName)}">编辑</button>` : ""}
+        ${t === "pf" ? `<button class="btn danger" data-act="del" data-node="${esc(node)}" data-app="${esc(a.appName)}"
+          data-pf="${esc(a.protocol || "")}" data-port="${esc(a.srcPort || 0)}">删除</button>` : ""}
+      </td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="11" class="muted" style="text-align:center">无规则（点击上方「↻ 刷新」拉取在线设备规则）</td></tr>`;
+}
+
+$("tlSearch").addEventListener("input", renderTunnels);
+$("tlTypePf").addEventListener("change", renderTunnels);
+$("tlTypeSd").addEventListener("change", renderTunnels);
+$("tlNodeFilter").addEventListener("change", renderTunnels);
+
+$("tlTable").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn) return;
+  const { act, node, app, pf, port, peer, en } = btn.dataset;
+  if (act === "toggle") {
+    await pushCmd(node, 10, { appName: app, peerNode: peer, protocol: pf, srcPort: +port, enabled: +en });
+    toast(en === "1" ? `已启用 ${app}` : `已停用 ${app}`);
+    setTimeout(() => refreshTunnels(true), 1500);
+  } else if (act === "del") {
+    if (!(await confirmDlg("删除规则", `确认在 ${node} 上删除规则「${app}」(${pf}:${port})？该操作直接下发到设备。`))) return;
+    await pushCmd(node, 9, { appName: app, protocol0: pf, srcPort0: +port, protocol: pf, srcPort: 0, peerNode: peer });
+    toast(`已下发删除指令: ${app}`);
+    setTimeout(() => refreshTunnels(true), 2000);
+  } else if (act === "edit") {
+    const rule = (state.tunnelByNode[node] || []).find((a) => a.appName === app && a.srcPort == port);
+    if (rule) openRuleDialog(node, rule);
+  }
+});
+
+$("btnRefreshAll").addEventListener("click", () => refreshAll());
+
+/* ---------------- 新建/编辑转发规则 ---------------- */
+function fillNodeSelects() {
+  const opts = state.devices.map((d) =>
+    `<option value="${esc(d.name)}">${esc(d.name)}${onlineDev(d) ? "" : "（离线）"}</option>`).join("");
+  $("ruNode").innerHTML = opts;
+  $("ruPeer").innerHTML = opts;
+}
+
+function openRuleDialog(node, existing) {
+  fillNodeSelects();
+  $("ruleErr").classList.add("hidden");
+  const editing = !!existing;
+  $("ruleDlgTitle").textContent = editing ? `编辑规则（${node}）` : "新建转发规则";
+  $("ruNode").value = node;
+  $("ruNode").disabled = editing;
+  if (editing) {
+    $("ruAppName").value = existing.appName;
+    $("ruSrcPort").value = existing.srcPort;
+    $("ruProto").value = existing.protocol || "tcp";
+    $("ruPeer").value = existing.peerNode || "";
+    $("ruDstHost").value = existing.dstHost || "localhost";
+    $("ruDstPort").value = existing.dstPort || "";
+    $("ruAppName").dataset.protocol0 = existing.protocol || "tcp";
+    $("ruAppName").dataset.srcPort0 = existing.srcPort;
+  } else {
+    $("ruAppName").value = "";
+    $("ruSrcPort").value = "";
+    $("ruProto").value = "tcp";
+    $("ruPeer").selectedIndex = 0;
+    $("ruDstHost").value = "localhost";
+    $("ruDstPort").value = "";
+    delete $("ruAppName").dataset.protocol0;
+    delete $("ruAppName").dataset.srcPort0;
+  }
+  $("ruleDialog").showModal();
+}
+
+$("btnAddRule").addEventListener("click", () => {
+  const online = state.devices.filter(onlineDev);
+  if (!online.length) { toast("无在线设备，无法下发规则", "err"); return; }
+  openRuleDialog(online[0].name, null);
+});
+
+$("ruCancel").addEventListener("click", () => $("ruleDialog").close());
+
+$("ruleForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const node = $("ruNode").value;
+  const body = {
+    appName: $("ruAppName").value.trim(),
+    protocol: $("ruProto").value,
+    srcPort: +$("ruSrcPort").value,
+    peerNode: $("ruPeer").value,
+    dstHost: $("ruDstHost").value.trim() || "localhost",
+    dstPort: +$("ruDstPort").value,
+    enabled: 1,
+  };
+  if (!body.appName || !body.srcPort || !body.dstPort || !body.peerNode) {
+    $("ruleErr").textContent = "请完整填写所有字段";
+    $("ruleErr").classList.remove("hidden");
+    return;
+  }
+  if ($("ruAppName").dataset.protocol0) {
+    body.protocol0 = $("ruAppName").dataset.protocol0;
+    body.srcPort0 = +$("ruAppName").dataset.srcPort0;
+  }
+  const rsp = await pushCmd(node, 9, body, 0);
+  if (rsp.status === 200) {
+    $("ruleDialog").close();
+    toast(`规则已下发到 ${node}，正在确认…`);
+    setTimeout(() => refreshTunnels(true), 2000);
+  } else {
+    $("ruleErr").textContent = "下发失败: " + JSON.stringify(rsp.data).slice(0, 160);
+    $("ruleErr").classList.remove("hidden");
+  }
+});
+
+/* ---------------- 虚拟网络 ---------------- */
+function nextVirtualIP(used) {
+  const gw = ($("netGateway").value || "").split("/");
+  const base = (gw[0] || "10.11.1.254").split(".").slice(0, 3).join(".");
+  for (let i = 2; i < 254; i++) {
+    const cand = `${base}.${i}`;
+    if (!used.has(cand)) { used.add(cand); return cand; }
+  }
+  return "";
+}
+
+function renderNetwork() {
+  if (!state.sdwan) {
+    $("netLoading").textContent = "未获取到虚拟网络配置";
+    return;
+  }
+  $("netLoading").classList.add("hidden");
+  $("netEditor").classList.remove("hidden");
+  const s = state.sdwan;
+  $("netName").value = s.name || "";
+  $("netGateway").value = s.gateway || "";
+  $("netMode").value = s.mode || "fullmesh";
+  $("netMtu").value = s.mtu || 1420;
+  $("netPunch").value = String(s.punchPriority ?? 1);
+
+  $("netCentral").innerHTML = [`<option value="">不指定</option>`]
+    .concat(state.devices.map((d) => `<option value="${esc(d.name)}">${esc(d.name)}</option>`)).join("");
+  $("netCentral").value = s.centralNode || "";
+  $("netCentralWrap").style.display = $("netMode").value === "central" ? "" : "none";
+
+  const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
+  const members = s.Nodes || [];
+  // 成员连接状态：从隧道缓存推导（成员名在任一设备规则里且 isActive）
+  const sdTunnels = Object.entries(state.tunnelByNode).flatMap(([node, apps]) =>
+    apps.filter((a) => !a.srcPort).map((a) => ({ node, peer: a.peerNode, isActive: a.isActive === 1 })));
+  const statusOf = (name) => {
+    const rel = sdTunnels.filter((t) => t.node === name || t.peer === name);
+    if (!rel.length) return { txt: "无隧道数据", cls: "" };
+    const active = rel.filter((t) => t.isActive).length;
+    return active > 0
+      ? { txt: `✅ ${active}/${rel.length} 条活跃`, cls: "ok" }
+      : { txt: `· 0/${rel.length} 条活跃`, cls: "dim" };
+  };
+
+  const tbody = $("netTable").querySelector("tbody");
+  tbody.innerHTML = members.map((m, i) => {
+    const dev = devMap[m.name];
+    const st = statusOf(m.name);
+    const on = dev && onlineDev(dev);
+    const pubIp = dev ? dev.ip : "-";
+    return `<tr data-idx="${i}">
+      <td class="name">${esc(m.name)}${dev ? "" : ' <span class="tag" style="color:var(--red)">不在设备列表</span>'}</td>
+      <td><input class="input ip-input" style="width:140px" value="${esc(m.ip || "")}" data-k="ip"></td>
+      <td class="ip">${copyBtn(pubIp, "ip")}</td>
+      <td><span class="dot ${on ? "on" : "off"}"></span>${dev ? (on ? "在线" : "离线") : "-"}</td>
+      <td class="${st.cls}">${st.txt}</td>
+      <td><input class="input res-input" style="width:260px" value="${esc(m.resource || "")}" data-k="resource" placeholder="192.168.3.0/24,192.168.1.8/32"></td>
+      <td class="op"><button class="btn danger" data-act="rm">移除</button></td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="7" class="muted" style="text-align:center">无成员</td></tr>`;
+
+  // 成员明细下拉
+  $("memSel").innerHTML = members.map((m) => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
+}
+
+$("netMode").addEventListener("change", () => {
+  $("netCentralWrap").style.display = $("netMode").value === "central" ? "" : "none";
+});
+
+/* 批量加入成员 */
+$("btnBatchAddMember").addEventListener("click", () => {
+  const members = new Set((state.sdwan.Nodes || []).map((m) => m.name));
+  const candidates = state.devices.filter((d) => !members.has(d.name));
+  if (!candidates.length) { toast("所有设备都已在网络中", "err"); return; }
+  $("mdList").innerHTML = candidates.map((d) =>
+    `<label class="md-item"><input type="checkbox" value="${esc(d.name)}">
+     <span class="name">${esc(d.name)}</span>
+     <span class="muted">${esc(d.ip || "")} ${onlineDev(d) ? "· 在线" : "· 离线"}</span></label>`).join("");
+  $("memberDialog").showModal();
+});
+$("mdCancel").addEventListener("click", () => $("memberDialog").close());
+$("memberForm").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const picked = [...$("mdList").querySelectorAll("input:checked")].map((c) => c.value);
+  if (!picked.length) { $("memberDialog").close(); return; }
+  const used = new Set((state.sdwan.Nodes || []).map((m) => m.ip).filter(Boolean));
+  for (const name of picked) {
+    state.sdwan.Nodes.push({ name, ip: nextVirtualIP(used) });
+  }
+  $("memberDialog").close();
+  renderNetwork();
+  toast(`已添加 ${picked.length} 台设备（虚拟 IP 已自动分配），点击「保存整网配置」生效`);
+});
+
+$("netTable").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button[data-act=rm]");
+  if (!btn) return;
+  const idx = +btn.closest("tr").dataset.idx;
+  const name = state.sdwan.Nodes[idx].name;
+  state.sdwan.Nodes.splice(idx, 1);
+  renderNetwork();
+  toast(`已移除 ${name}（未保存）`);
+});
+
+$("btnNetSave").addEventListener("click", async () => {
+  if (!(await confirmDlg("保存虚拟网络", "将把整网配置（成员/虚拟 IP/子网代理 resource 变更）全量提交并下发到各成员，网络会短暂收敛。继续？"))) return;
+  const s = state.sdwan;
+  s.name = $("netName").value.trim();
+  s.gateway = $("netGateway").value.trim();
+  s.mode = $("netMode").value;
+  s.centralNode = $("netCentral").value;
+  s.punchPriority = +$("netPunch").value;
+  s.mtu = +$("netMtu").value || 1420;
+  document.querySelectorAll("#netTable tbody tr").forEach((tr) => {
+    const idx = +tr.dataset.idx;
+    if (s.Nodes[idx]) {
+      s.Nodes[idx].ip = tr.querySelector(".ip-input").value.trim();
+      s.Nodes[idx].resource = tr.querySelector(".res-input").value.trim();
+    }
+  });
+  const rsp = await pxp("/api/v1/sdwan/edit", { method: "POST", body: s });
+  if (rsp.status === 200) {
+    toast("虚拟网络已保存并下发（含子网代理配置）");
+  } else {
+    toast("保存失败: " + JSON.stringify(rsp.data).slice(0, 160), "err");
+  }
+});
+
+/* 成员隧道明细（MsgPushReportMemApps=17，仅在线成员可查） */
+$("btnMemRefresh").addEventListener("click", async () => {
+  const member = $("memSel").value;
+  if (!member) return;
+  const dev = state.devices.find((d) => d.name === member);
+  if (!dev || !onlineDev(dev)) { toast(`${member} 离线，无法读取隧道状态`, "err"); return; }
+  $("memSummary").textContent = `正在读取 ${member} 的组网隧道…`;
+  const rsp = await pushCmd(member, 17, {}, 1);
+  if (rsp.status === 200 && Array.isArray(rsp.data.Apps)) {
+    state.memApps = rsp.data.Apps.slice().sort((a, b) => (a.peerNode || "").localeCompare(b.peerNode || ""));
+    $("memSummary").textContent = `${member} 共 ${state.memApps.length} 条组网隧道`;
+  } else {
+    state.memApps = [];
+    $("memSummary").textContent = `${member} 无隧道数据或读取超时（对端全离线时可能发生）`;
+  }
+  renderMemApps();
+});
+
+function renderMemApps() {
+  const tbody = $("memTable").querySelector("tbody");
+  tbody.innerHTML = state.memApps.map((a) => {
+    const relay = a.specRelayNode || a.relayNode || "";
+    return `<tr>
+      <td>${esc($("memSel").value)}</td>
+      <td class="name">${esc(a.peerNode || "-")}</td>
+      <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
+      <td class="relay">${relay ? esc(relay) : '<span class="muted">P2P 直连</span>'}</td>
+      <td>${a.isActive ? "✅ 活跃" : (a.enabled === 0 ? "⏸ 停用" : "· 未连接")}</td>
+      <td>${esc(fmtTime(a.connectTime))}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="6" class="muted" style="text-align:center">点击右上「查看」读取所选成员的隧道状态</td></tr>`;
+}
+
+/* ---------------- 下载安装 ---------------- */
+function renderDownload() {
+  if (!state.latestVer) return;
+  const it = state.profile?.token || (state.sdwan ? "" : "");
+  let domain = "console.openpxp.com";
+  try {
+    domain = new URL(state.upstream || "https://console.openpxp.com").host;
+  } catch {
+    domain = (state.upstream || "").replace(/^https?:\/\//, "").split("/")[0] || "console.openpxp.com";
+  }
+  const ver = state.latestVer;
+  $("dlVer").textContent = ver;
+  if (it) {
+    $("dlWin64").href = `https://${domain}/download/v1/${ver}/openp2p64-api.openp2p.cn-${it}-setup${ver}.exe`;
+    $("dlWin32").href = `https://${domain}/download/v1/${ver}/openp2p32-api.openp2p.cn-${it}-setup${ver}.exe`;
+    $("dlWinArm64").href = `https://${domain}/download/v1/${ver}/openp2parm64-api.openp2p.cn-${it}-setup${ver}.exe`;
+    $("dlAndroid").href = `https://${domain}/download/v1/${ver}/openp2p-${ver}.apk`;
+    const shCmd = (tool) =>
+      `${tool} --no-check-certificate -O install.sh "https://${domain}/download/v1/${ver}/install.sh" && ` +
+      `sudo bash ./install.sh --token ${it} --ver ${ver} --domain ${domain}`;
+    $("dlLinuxCmd").textContent = shCmd("curl -k");
+    $("dlWgetCmd").textContent = shCmd("wget");
+    $("dlMacCmd").textContent = shCmd("curl -k");
+    $("dlDockerCmd").textContent =
+      `docker run -d --privileged --cap-add=NET_ADMIN --device=/dev/net/tun ` +
+      `-e OPENP2P_TOKEN=${it} --name openp2p openp2p/openp2p:latest`;
+  }
+}
+
+document.addEventListener("click", async (ev) => {
+  // IP/值迷你复制按钮
+  const mini = ev.target.closest(".copy-mini");
+  if (mini) {
+    ev.stopPropagation();
+    await copyToClipboard(mini.dataset.copyText);
+    const oldText = mini.textContent;
+    mini.textContent = "✓";
+    mini.style.color = "var(--accent)";
+    setTimeout(() => {
+      mini.textContent = oldText;
+      mini.style.color = "";
+    }, 1500);
+    return;
+  }
+  // 下载页命令块复制按钮
+  const btn = ev.target.closest(".copy-btn");
+  if (!btn) return;
+  await copyToClipboard($(btn.dataset.copy).textContent);
+  const oldText = btn.textContent;
+  btn.textContent = "已复制 ✓";
+  btn.style.borderColor = "var(--accent)";
+  btn.style.color = "var(--accent)";
+  setTimeout(() => {
+    btn.textContent = oldText;
+    btn.style.borderColor = "";
+    btn.style.color = "";
+  }, 1800);
+});
+
+/* ---------------- 主题切换（暗色/亮色） ---------------- */
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  localStorage.setItem("panelTheme", theme);
+  $("btnTheme").textContent = theme === "light" ? "☀️" : "🌙";
+}
+$("btnTheme").addEventListener("click", () => {
+  applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+  reloadCaptcha(); // 验证码配色跟随主题
+});
+applyTheme(localStorage.getItem("panelTheme") || "dark");
+
+/* ---------------- 控制台设置与上游域名切换 ---------------- */
+$("btnSettings").addEventListener("click", () => {
+  $("settingsErr").classList.add("hidden");
+  if ($("setCurUpstream")) $("setCurUpstream").value = state.upstream || "https://console.openpxp.com";
+  $("settingsDialog").showModal();
+});
+
+$("setCancel").addEventListener("click", () => $("settingsDialog").close());
+
+document.querySelectorAll("[data-upstream-set]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    if ($("setCurUpstream")) $("setCurUpstream").value = btn.dataset.upstreamSet;
+  });
+});
+
+$("settingsForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("settingsErr").classList.add("hidden");
+  const newUp = $("setCurUpstream").value.trim().replace(/\/+$/, "");
+  if (!newUp.startsWith("http://") && !newUp.startsWith("https://")) {
+    $("settingsErr").textContent = "官方控制台地址必须以 http:// 或 https:// 开头";
+    $("settingsErr").classList.remove("hidden");
+    return;
+  }
+  const rsp = await pxp2("/api/upstream", { upstream: newUp });
+  if (rsp.error === 0) {
+    state.upstream = rsp.upstream;
+    if ($("loginUpstream")) $("loginUpstream").value = state.upstream;
+    $("settingsDialog").close();
+    toast(`已更新官方控制台地址为 ${state.upstream}`, "ok");
+    renderDownload();
+    await refreshAll();
+  } else {
+    $("settingsErr").textContent = rsp.detail || "保存设置失败";
+    $("settingsErr").classList.remove("hidden");
+  }
+});
+
+/* ---------------- 视图切换 ---------------- */
+function switchView(name) {
+  state.selView = name;
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === name));
+  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("hidden", v.id !== "view-" + name));
+}
+document.querySelectorAll(".tab").forEach((t) =>
+  t.addEventListener("click", () => {
+    switchView(t.dataset.view);
+    if (t.dataset.view === "tunnels" && !Object.keys(state.tunnelByNode).length) refreshTunnels();
+  })
+);
+
+/* ---------------- 启动 ---------------- */
+(async () => {
+  if (await checkState()) {
+    await enterMain();
+  } else {
+    $("loginView").classList.remove("hidden");
+    $("connState").textContent = "未登录";
+    if (state.user) $("loginUser").value = state.user;
+    await reloadCaptcha();
+  }
+})();

@@ -1,0 +1,14 @@
+{
+  "upstream": "https://console.openpxp.com",
+  "user": "your_username",
+  "password": "your_password",
+  "token": "your_jwt_token_here",
+  "accounts": [
+    {
+      "user": "account1",
+      "token": "jwt_token_for_account1",
+      "password": "password_for_account1"
+    }
+  ],
+  "activeUser": "account1"
+}
