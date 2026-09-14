@@ -18,6 +18,7 @@ const state = {
   upstream: "https://console.openpxp.com",
   accounts: [],       // 多账户列表（服务端 /api/state）
   memByNode: {},      // node -> MemApps[]（subtype=17 成员级组网隧道状态）
+  ruleCtxNode: "",    // 新建规则的上下文设备（从设备卡/组网成员跳转时记录）
   disabledApps: new Set(), // 本会话内停用过的规则 key（设备停用后上报不再带 enabled 字段）
   selView: "devices",
 };
@@ -651,6 +652,7 @@ $("devTable").addEventListener("click", (ev) => {
   if (act === "tunnels") {
     switchView("tunnels");
     $("tlNodeFilter").value = node;
+    state.ruleCtxNode = node; // 记住上下文：新建规则时默认落在该设备
     renderTunnels();
   } else if (act === "editdev") openDevDialog(node);
   else if (act === "restart") doRestart([node]);
@@ -914,7 +916,12 @@ function openRuleDialog(node, existing) {
 $("btnAddRule").addEventListener("click", () => {
   const online = state.devices.filter(onlineDev);
   if (!online.length) { toast("无在线设备，无法下发规则", "err"); return; }
-  openRuleDialog(online[0].name, null);
+  // 默认所在设备优先级：当前筛选设备 > 跳转来源上下文 > 第一台在线设备
+  const ctx = state.ruleCtxNode;
+  const filter = $("tlNodeFilter").value;
+  const preferred = [filter, ctx].filter(Boolean)
+    .find((n) => onlineDev(state.devices.find((d) => d.name === n) || {}));
+  openRuleDialog(preferred || online[0].name, null);
 });
 
 $("ruCancel").addEventListener("click", () => $("ruleDialog").close());
@@ -1074,6 +1081,7 @@ $("netTable").addEventListener("click", (ev) => {
   if (link) {
     switchView("tunnels");
     $("tlNodeFilter").value = link.dataset.jump;
+    state.ruleCtxNode = link.dataset.jump;
     renderTunnels();
     toast(`已按设备「${link.dataset.jump}」筛选隧道`, "ok");
     return;
