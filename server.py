@@ -124,18 +124,24 @@ def tighten_config_perm() -> None:
             pass
 
 
-def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
-    return f"{salt}:{h.hex()}"
+# 密码在本地是"可还原"存储（面板要拿明文向官方重登），无法做单向哈希。
+# 采用混淆存储（XOR+base64）：防直接 grep/肉眼读取，不是加密——拿到本机即可破解。
+_OBF_KEY = "openp2p-panel-local"
 
 
-def verify_password(password: str, stored: str) -> bool:
-    if ':' not in stored:
-        return hmac.compare_digest(password, stored)
-    salt, h = stored.split(':', 1)
-    check = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
-    return hmac.compare_digest(check.hex(), h)
+def obf_encode(text: str) -> str:
+    data = text.encode()
+    key = _OBF_KEY.encode()
+    return base64.b64encode(bytes(b ^ key[i % len(key)] for i, b in enumerate(data))).decode()
+
+
+def obf_decode(text: str) -> str:
+    try:
+        data = base64.b64decode(text)
+        key = _OBF_KEY.encode()
+        return bytes(b ^ key[i % len(key)] for i, b in enumerate(data)).decode()
+    except Exception:
+        return text  # 兼容旧明文
 
 
 # ---------- 验证码与失败锁定 ----------
@@ -331,7 +337,7 @@ class Upstream:
                 pool.append(acc)
             acc["token"] = token
             if password is not None:
-                acc["password"] = password
+                acc["password"] = obf_encode(password)
             self.user = user
             self.token = token
             self.token_user = self.jwt_user(token)
@@ -415,7 +421,7 @@ class Upstream:
         # token 缺失/过期，尝试用当前账户保存的密码重登
         acc = self._active()
         if acc and acc.get("password"):
-            self.login(acc["user"], acc["password"])
+            self.login(acc["user"], obf_decode(acc["password"]))
             with self.lock:
                 return self.token
         return token
@@ -595,9 +601,15 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 self._json({"error": -1, "detail": "请求体不是合法 JSON"})
                 return
+            from urllib.parse import urlparse
+
             new_up = (data.get("upstream") or "").strip().rstrip("/")
             if not new_up.startswith("http://") and not new_up.startswith("https://"):
                 self._json({"error": -1, "detail": "官方控制台地址必须以 http:// 或 https:// 开头"})
+                return
+            host = (urlparse(new_up).hostname or "").lower()
+            if host not in ("console.openp2p.cn", "console.openpxp.com", "openp2p.cn", "openpxp.com"):
+                self._json({"error": -1, "detail": f"仅支持官方域名（console.openp2p.cn / console.openpxp.com），拒绝: {host}"})
                 return
             _upstream.cfg["upstream"] = new_up
             save_config(_upstream.cfg)
@@ -759,9 +771,9 @@ def main():
             print("[panel] token 已失效")
     acc = _upstream._active() or {}
     if not token_ok and acc.get("password"):
-        rsp = _upstream.login(acc["user"], acc["password"])
+        rsp = _upstream.login(acc["user"], obf_decode(acc["password"]))
         if rsp.get("error") == 0:
-            print(f"[panel] 已自动登录: {acc['user']}")
+            print(f"[panel] 已自动登录: {acc['user']}", flush=True)
         else:
             print(f"[panel] 自动登录失败: {rsp}")
 

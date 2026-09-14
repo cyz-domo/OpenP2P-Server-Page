@@ -18,6 +18,7 @@ const state = {
   upstream: "https://console.openpxp.com",
   accounts: [],       // 多账户列表（服务端 /api/state）
   memByNode: {},      // node -> MemApps[]（subtype=17 成员级组网隧道状态）
+  disabledApps: new Set(), // 本会话内停用过的规则 key（设备停用后上报不再带 enabled 字段）
   selView: "devices",
 };
 
@@ -632,8 +633,16 @@ function renderTunnels() {
   const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
   // 连接状态四态推导（字段语义来自实测：isActive=1 已连接；connectTime 为 0001-01-01 零值表示从未连上）
   const ZERO_TIME = "0001-01-01";
-  const connStateOf = (a) => {
-    if (a.enabled === 0) return { txt: "已停用", cls: "cs-off", key: "off" };
+  const isEnabled = (a, node) => {
+    // 设备停用规则后上报的 JSON 里 enabled 字段会消失（实测），因此：
+    // 有 enabled 字段 → 以设备为准；无字段 → 默认启用，但本会话下发过停用指令的视为停用
+    if (a.enabled === undefined || a.enabled === null) {
+      return !state.disabledApps.has(node + "|" + a.appName + "|" + a.srcPort);
+    }
+    return a.enabled !== 0;
+  };
+  const connStateOf = (a, node) => {
+    if (!isEnabled(a, node)) return { txt: "已停用", cls: "cs-off", key: "off" };
     if (a.isActive === 1) return { txt: "✅ 已连接", cls: "cs-ok", key: "ok" };
     const never = !a.connectTime || String(a.connectTime).startsWith(ZERO_TIME);
     const peerDev = devMap[a.peerNode];
@@ -651,7 +660,7 @@ function renderTunnels() {
         const hay = [a.appName, a.peerNode, a.dstHost, a.relayNode, a.specRelayNode, a.linkMode].join(" ").toLowerCase();
         if (!hay.includes(kw)) continue;
       }
-      const cs = connStateOf(a);
+      const cs = connStateOf(a, node);
       rows.push({ node, a, t, cs });
     }
   }
@@ -691,11 +700,11 @@ function renderTunnels() {
       <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
       <td class="relay">${relay}</td>
       <td class="${cs.cls}">${cs.txt}</td>
-      <td>${a.enabled === 0 ? `<a class="tag" style="color:var(--danger)">停用</a>` : "✅"}</td>
+      <td>${isEnabled(a, node) ? "✅" : `<a class="tag" style="color:var(--danger)">停用</a>`}</td>
       <td class="op">
         <button class="btn" data-act="toggle" data-node="${esc(node)}" data-app="${esc(a.appName)}"
           data-pf="${esc(a.protocol || "")}" data-port="${esc(a.srcPort || 0)}" data-peer="${esc(a.peerNode || "")}"
-          data-en="${a.enabled === 0 ? 1 : 0}">${a.enabled === 0 ? "启用" : "停用"}</button>
+          data-en="${isEnabled(a, node) ? 0 : 1}">${isEnabled(a, node) ? "停用" : "启用"}</button>
         <button class="btn" data-act="edit" data-node="${esc(node)}" data-app="${esc(a.appName)}">编辑</button>
         <button class="btn danger" data-act="del" data-node="${esc(node)}" data-app="${esc(a.appName)}"
           data-pf="${esc(a.protocol || "")}" data-port="${esc(a.srcPort || 0)}">删除</button>
@@ -767,9 +776,34 @@ $("tlTable").addEventListener("click", async (ev) => {
   if (!btn) return;
   const { act, node, app, pf, port, peer, en } = btn.dataset;
   if (act === "toggle") {
-    await pushCmd(node, 10, { appName: app, peerNode: peer, protocol: pf, srcPort: +port, enabled: +en });
-    toast(en === "1" ? `已启用 ${app}` : `已停用 ${app}`);
-    setTimeout(() => refreshTunnels(true), 1500);
+    const key = node + "|" + app + "|" + port;
+    const target = (state.tunnelByNode[node] || []).find((a) => a.appName === app && a.srcPort == port);
+    const newEnabled = en === "1" ? 1 : 0; // 按钮上写的是"将变成的状态"
+    // 乐观更新：本地立即翻转状态列与按钮，不等设备回执
+    if (target) target.enabled = newEnabled;
+    if (newEnabled) state.disabledApps.delete(key);
+    else state.disabledApps.add(key);
+    renderTunnels();
+    toast(newEnabled ? `已启用 ${app}` : `已停用 ${app}`, "ok");
+    const rsp = await pushCmd(node, 10, { appName: app, peerNode: peer, protocol: pf, srcPort: +port, enabled: newEnabled });
+    if (rsp.status !== 200) {
+      // 下发失败：回滚本地状态
+      if (target) target.enabled = newEnabled ? 0 : 1;
+      renderTunnels();
+      toast(`指令下发失败（${JSON.stringify(rsp.data).slice(0, 80)}），已恢复显示`, "err");
+      return;
+    }
+    // 轮询确认真实状态（设备应用有延迟），以设备回报为准纠正
+    setTimeout(async () => {
+      await refreshTunnels(true);
+      const real = (state.tunnelByNode[node] || []).find((a) => a.appName === app && a.srcPort == port);
+      const realEnabled = real ? isEnabled(real, node) : true;
+      if (real && realEnabled !== !!newEnabled) {
+        if (realEnabled) state.disabledApps.delete(key); // 设备实际是启用 → 清本地停用标记
+        toast(`${app} 设备侧状态为 ${realEnabled ? "启用" : "停用"}（与指令不符，已按设备实际状态显示）`, "err");
+        renderTunnels();
+      }
+    }, 2500);
   } else if (act === "del") {
     if (!(await confirmDlg("删除规则", `确认在 ${node} 上删除规则「${app}」(${pf}:${port})？该操作直接下发到设备。`))) return;
     await pushCmd(node, 9, { appName: app, protocol0: pf, srcPort0: +port, protocol: pf, srcPort: 0, peerNode: peer });

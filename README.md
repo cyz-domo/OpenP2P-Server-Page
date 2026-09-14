@@ -193,3 +193,21 @@ openp2p-panel/
     ├── app.css            # 现代 Obsidian/Zinc 设计系统与动效样式
     └── app.js             # 纯原生交互逻辑
 ```
+
+## 与官方控制台的功能差距（审计记录 2026-09-14）
+
+以下官方能力面板暂未实现，按实用度排序：
+
+1. **转发规则白名单**（whitelist）——编辑规则时的 IP 白名单字段
+2. **共享带宽设置**（ShareBandwidth）——贡献带宽换取服务优先级
+3. **强制 IPv6 连接**（forcev6）——设备级开关
+4. **重置密码**（/api/v2/user/resetpwd）——忘记密码流程
+5. **对端服务探测**（MsgPushCheckRemoteService=19）——添加规则前探测目标端口可达性
+
+以上接口均已逆向并记录在 `docs/openp2p-console-api.md`，按需添加即可。
+
+## 安全声明
+
+- 本地面板密码为**可还原混淆存储**（XOR+base64）：因为面板必须拿明文向官方重登，无法做单向哈希。混淆可防直接读取/误晒截图，但拿到服务器文件即可还原——**请勿在不可信主机上使用"记住密码"**
+- `/api/upstream` 仅接受官方域名白名单（console.openp2p.cn / console.openpxp.com），防 SSRF
+- config.json 的迁移：旧明文密码在启动时自动升级为混淆格式
