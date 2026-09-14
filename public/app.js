@@ -534,6 +534,7 @@ function renderDevices() {
       <td>${esc(fmtTime(d.activetime))}</td>
       <td class="op">
         <button class="btn" data-act="tunnels">规则</button>
+        <button class="btn" data-act="editdev">编辑</button>
         <button class="btn" data-act="restart">重启</button>
         <button class="btn" data-act="upgrade" ${upd ? "" : "disabled"}>升级</button>
         <button class="btn danger" data-act="delete">删除</button>
@@ -570,6 +571,58 @@ async function doDeleteDevices(nodes) {
   await refreshAll();
 }
 
+/* ---------------- 设备编辑（改名/带宽/forcev6/公网端口，官方 POST /device/<n>/edit 同款） ---------------- */
+function openDevDialog(node) {
+  const d = state.devices.find((x) => x.name === node);
+  if (!d) return;
+  $("devDlgTitle").textContent = `编辑设备：${node}`;
+  $("dvName").value = node;
+  $("dvBandwidth").value = d.bandwidth ?? 0;
+  $("dvPublicPort").value = d.publicIPPort ?? 0;
+  $("dvForcev6").checked = d.forcev6 === 1 || d.forcev6 === "1";
+  $("devErr").classList.add("hidden");
+  $("dvName").dataset.orig = node;
+  $("devDialog").showModal();
+}
+
+$("dvCancel").addEventListener("click", () => $("devDialog").close());
+
+$("devForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const orig = $("dvName").dataset.orig;
+  const newName = $("dvName").value.trim();
+  if (newName.length < 8) {
+    $("devErr").textContent = "设备名不能少于 8 个字符（官方限制）";
+    $("devErr").classList.remove("hidden");
+    return;
+  }
+  const saveBtn = $("dvSave");
+  saveBtn.disabled = true;
+  saveBtn.textContent = "保存中…";
+  try {
+    const rsp = await pxp(`/api/v1/device/${encodeURIComponent(orig)}/edit`, {
+      method: "POST",
+      body: {
+        newName,
+        bandwidth: +$("dvBandwidth").value || 0,
+        forcev6: $("dvForcev6").checked ? 1 : 0,
+        publicIPPort: +$("dvPublicPort").value || 0,
+      },
+    });
+    if (rsp.status === 200 && rsp.data.error === 0) {
+      $("devDialog").close();
+      toast(`设备 ${orig} 已更新`, "ok");
+      await refreshAll();
+    } else {
+      $("devErr").textContent = "保存失败: " + JSON.stringify(rsp.data).slice(0, 140);
+      $("devErr").classList.remove("hidden");
+    }
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = "保存";
+  }
+});
+
 async function doRestart(nodes) {
   if (!(await confirmDlg("重启设备", `将对 ${nodes.length} 台设备下发重启指令，期间其转发/组网会短暂中断。继续？`))) return;
   for (const n of nodes) await pushCmd(n, 11, {});
@@ -599,7 +652,8 @@ $("devTable").addEventListener("click", (ev) => {
     switchView("tunnels");
     $("tlNodeFilter").value = node;
     renderTunnels();
-  } else if (act === "restart") doRestart([node]);
+  } else if (act === "editdev") openDevDialog(node);
+  else if (act === "restart") doRestart([node]);
   else if (act === "upgrade") doUpgrade([node]);
   else if (act === "delete") doDeleteDevices([node]);
 });
@@ -839,6 +893,7 @@ function openRuleDialog(node, existing) {
     $("ruPeer").value = existing.peerNode || "";
     $("ruDstHost").value = existing.dstHost || "localhost";
     $("ruDstPort").value = existing.dstPort || "";
+    $("ruWhitelist").value = existing.whitelist || "";
     $("ruAppName").dataset.protocol0 = existing.protocol || "tcp";
     $("ruAppName").dataset.srcPort0 = existing.srcPort;
   } else {
@@ -848,6 +903,8 @@ function openRuleDialog(node, existing) {
     $("ruPeer").selectedIndex = 0;
     $("ruDstHost").value = "localhost";
     $("ruDstPort").value = "";
+    $("ruWhitelist").value = "";
+    $("ruCheckResult").textContent = "";
     delete $("ruAppName").dataset.protocol0;
     delete $("ruAppName").dataset.srcPort0;
   }
@@ -862,6 +919,27 @@ $("btnAddRule").addEventListener("click", () => {
 
 $("ruCancel").addEventListener("click", () => $("ruleDialog").close());
 
+// 对端服务探测：在对端设备上检查 dstHost:dstPort 是否可达（MsgPushCheckRemoteService=19）
+$("ruCheckSvc").addEventListener("click", async () => {
+  const peer = $("ruPeer").value;
+  const host = $("ruDstHost").value.trim() || "localhost";
+  const port = +$("ruDstPort").value;
+  const out = $("ruCheckResult");
+  if (!peer || !port) { out.textContent = "请先填写目标端口并选择对端设备"; out.style.color = "var(--red)"; return; }
+  const dev = state.devices.find((d) => d.name === peer);
+  if (!dev || !onlineDev(dev)) { out.textContent = `对端 ${peer} 离线，无法探测`; out.style.color = "var(--red)"; return; }
+  out.textContent = `正在 ${peer} 上探测 ${host}:${port} …`;
+  out.style.color = "var(--muted)";
+  const rsp = await pushCmd(peer, 19, { host, port }, 1);
+  if (rsp.status === 200 && !rsp.data.error) {
+    out.textContent = `✅ ${host}:${port} 在 ${peer} 上可达`;
+    out.style.color = "var(--accent)";
+  } else {
+    out.textContent = `✗ 不可达或超时（${(rsp.data.detail || rsp.data.raw || "error " + rsp.status).slice(0, 60)}）`;
+    out.style.color = "var(--red)";
+  }
+});
+
 $("ruleForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const node = $("ruNode").value;
@@ -872,6 +950,7 @@ $("ruleForm").addEventListener("submit", async (ev) => {
     peerNode: $("ruPeer").value,
     dstHost: $("ruDstHost").value.trim() || "localhost",
     dstPort: +$("ruDstPort").value,
+    whitelist: $("ruWhitelist").value.trim(),
     enabled: 1,
   };
   if (!body.appName || !body.srcPort || !body.dstPort || !body.peerNode) {
@@ -1163,6 +1242,69 @@ document.addEventListener("click", async (ev) => {
     btn.style.borderColor = "";
     btn.style.color = "";
   }, 1800);
+});
+
+/* ---------------- 忘记密码（官方邮箱验证码流程） ---------------- */
+$("linkForgot").addEventListener("click", () => {
+  $("resetErr").classList.add("hidden");
+  $("resetDialog").showModal();
+});
+$("rpCancel").addEventListener("click", () => $("resetDialog").close());
+
+$("rpSendCode").addEventListener("click", async () => {
+  const email = $("rpEmail").value.trim();
+  const out = $("resetErr");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    out.textContent = "请输入合法邮箱地址";
+    out.classList.remove("hidden");
+    return;
+  }
+  const btn = $("rpSendCode");
+  btn.disabled = true;
+  btn.textContent = "发送中…";
+  try {
+    const rsp = await pxp(`/api/v2/verificationcode?email=${encodeURIComponent(email)}`, { method: "GET" });
+    if (rsp.status === 200 && rsp.data.error === 0) {
+      out.textContent = "✓ 验证码已发送，请查收邮箱";
+      out.style.color = "var(--accent)";
+      out.classList.remove("hidden");
+      let sec = 60;
+      const timer = setInterval(() => {
+        btn.textContent = `${sec--}s`;
+        if (sec < 0) { clearInterval(timer); btn.textContent = "发送验证码"; btn.disabled = false; }
+      }, 1000);
+    } else {
+      out.textContent = "发送失败: " + JSON.stringify(rsp.data).slice(0, 100);
+      out.style.color = "var(--red)";
+      out.classList.remove("hidden");
+      btn.disabled = false;
+      btn.textContent = "发送验证码";
+    }
+  } catch (e) {
+    out.textContent = "发送异常: " + e;
+    out.style.color = "var(--red)";
+    out.classList.remove("hidden");
+    btn.disabled = false;
+  }
+});
+
+$("resetForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const out = $("resetErr");
+  const pass = $("rpPass").value, pass2 = $("rpPass2").value;
+  if (pass !== pass2) { out.textContent = "两次输入的密码不一致"; out.style.color = "var(--red)"; out.classList.remove("hidden"); return; }
+  const rsp = await pxp("/api/v2/user/resetpwd", {
+    method: "POST",
+    body: { code: $("rpCode").value.trim(), password: pass, email: $("rpEmail").value.trim() },
+  });
+  if (rsp.status === 200 && rsp.data.error === 0) {
+    $("resetDialog").close();
+    toast("密码已重置，请用新密码登录", "ok");
+  } else {
+    out.textContent = "重置失败: " + JSON.stringify(rsp.data).slice(0, 120);
+    out.style.color = "var(--red)";
+    out.classList.remove("hidden");
+  }
 });
 
 /* ---------------- 主题切换（暗色/亮色） ---------------- */

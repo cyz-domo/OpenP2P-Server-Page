@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OpenP2P 管理面板</title>
-<link rel="stylesheet" href="app.css?v=20260914f">
+<link rel="stylesheet" href="app.css?v=20260914h">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%2310b981%22 stroke-width=%222%22><circle cx=%2212%22 cy=%225%22 r=%222.2%22/><circle cx=%225%22 cy=%2219%22 r=%222.2%22/><circle cx=%2219%22 cy=%2219%22 r=%222.2%22/><path d=%22M11 7l-5 10M13 7l5 10M7.2 19h9.6%22/></svg>">
 </head>
 <body>
@@ -115,6 +115,7 @@
 
       <div id="loginErr" class="err hidden"></div>
       <button class="btn primary block btn-lg" type="submit">立即登录</button>
+      <p style="text-align:center;margin:0"><a href="javascript:" id="linkForgot" style="color:var(--muted);font-size:12.5px">忘记密码？</a></p>
     </form>
   </section>
 
@@ -475,6 +476,34 @@
   </main>
 </div>
 
+<!-- 设备编辑弹窗（改名/共享带宽/forcev6/公网监听端口） -->
+<dialog id="devDialog">
+  <form id="devForm" method="dialog">
+    <h3 id="devDlgTitle">编辑设备</h3>
+    <label class="form-group">
+      <span class="label-text">设备名（官方要求 8 字符以上）</span>
+      <input id="dvName" class="input" minlength="8" required>
+    </label>
+    <div class="row2">
+      <label class="form-group">
+        <span class="label-text">共享带宽 (Mbps，0=关闭)</span>
+        <input id="dvBandwidth" class="input" type="number" min="0" max="1000">
+      </label>
+      <label class="form-group">
+        <span class="label-text">公网监听端口</span>
+        <input id="dvPublicPort" class="input" type="number" min="0" max="65535">
+      </label>
+    </div>
+    <label class="chk"><input id="dvForcev6" type="checkbox"> 强制使用 IPv6 连接（客户端 ≥ 3.24.27）</label>
+    <p class="muted" style="font-size:12px;margin:0">共享带宽：允许他人经此设备中继，可提升连接成功率与服务等级。</p>
+    <div id="devErr" class="err hidden"></div>
+    <div class="dlg-actions">
+      <button type="button" class="btn ghost" id="dvCancel">取消</button>
+      <button type="submit" class="btn primary" id="dvSave">保存</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- 新建/编辑转发规则弹窗 -->
 <dialog id="ruleDialog">
   <form id="ruleForm" method="dialog">
@@ -518,6 +547,14 @@
         <span class="label-text">目标端口</span>
         <input id="ruDstPort" class="input" type="number" min="1" max="65535" placeholder="例如：3389 / 80" required>
       </label>
+    </div>
+    <div class="form-group">
+      <span class="label-text">IP 白名单（可选，逗号分隔，留空=不限制）</span>
+      <input id="ruWhitelist" class="input" placeholder="192.168.1.8,10.0.0.0/24">
+    </div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <button type="button" class="btn" id="ruCheckSvc" title="在对端设备上探测目标端口是否可达（MsgPushCheckRemoteService）">🔎 探测目标服务</button>
+      <span id="ruCheckResult" class="muted" style="font-size:12.5px"></span>
     </div>
     <div id="ruleErr" class="err hidden"></div>
     <div class="dlg-actions">
@@ -566,6 +603,38 @@
   </form>
 </dialog>
 
+<!-- 忘记密码/重置弹窗（官方同款流程：邮箱验证码 + 新密码） -->
+<dialog id="resetDialog">
+  <form id="resetForm" method="dialog">
+    <h3>重置 OpenP2P 密码</h3>
+    <p class="muted" style="margin:0">向注册邮箱发送验证码，设置新密码（≥8 位）</p>
+    <div style="display:flex;gap:10px;align-items:flex-end">
+      <label class="form-group" style="flex:1">
+        <span class="label-text">注册邮箱</span>
+        <input id="rpEmail" class="input" type="email" placeholder="注册时填写的邮箱" required>
+      </label>
+      <button type="button" class="btn" id="rpSendCode" style="white-space:nowrap">发送验证码</button>
+    </div>
+    <label class="form-group">
+      <span class="label-text">邮箱验证码</span>
+      <input id="rpCode" class="input" placeholder="邮件中的验证码" required>
+    </label>
+    <label class="form-group">
+      <span class="label-text">新密码（≥8 位）</span>
+      <input id="rpPass" class="input" type="password" minlength="8" required>
+    </label>
+    <label class="form-group">
+      <span class="label-text">确认新密码</span>
+      <input id="rpPass2" class="input" type="password" minlength="8" required>
+    </label>
+    <div id="resetErr" class="err hidden"></div>
+    <div class="dlg-actions">
+      <button type="button" class="btn ghost" id="rpCancel">取消</button>
+      <button type="submit" class="btn primary">重置密码</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- 确认弹窗 -->
 <dialog id="confirmDialog">
   <form method="dialog">
@@ -583,6 +652,6 @@
 <!-- 悬浮 Toast 消息 -->
 <div id="toast" class="hidden"></div>
 
-<script src="app.js?v=20260914f"></script>
+<script src="app.js?v=20260914h"></script>
 </body>
 </html>
