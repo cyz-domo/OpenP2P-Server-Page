@@ -333,7 +333,10 @@ async function pxp2(path, body) {
 }
 
 /* ---------------- 数据加载 ---------------- */
+let _refreshing = false; // 防并发：refreshAll 重入会交错重绘 DOM 导致 null 引用
 async function refreshAll() {
+  if (_refreshing) return;
+  _refreshing = true;
   try {
     const [devs, sdw, prof] = await Promise.all([
       pxp("/api/v1/devices"),
@@ -354,7 +357,10 @@ async function refreshAll() {
     await refreshTunnels(true);
     loadMemStatus();
   } catch (e) {
+    console.error("[refreshAll]", e);
     toast("网络错误: " + e, "err");
+  } finally {
+    _refreshing = false;
   }
 }
 
@@ -660,13 +666,15 @@ function renderTunnels() {
   // 拆分：端口转发 → tlTable；组网隧道 → sdTable
   const pfRows = rows.filter((r) => r.t === "pf");
   const sdRows = rows.filter((r) => r.t === "sd");
+  if (!$("cntPf") || !$("cntSd") || !$("tlSummary")) return; // 视图元素未就绪（极端时序）直接跳过本轮渲染
   $("cntPf").textContent = pfRows.length;
   $("cntSd").textContent = sdRows.length;
   const visible = tlSub === "pf" ? pfRows : sdRows;
   $("tlSummary").textContent = `共 ${visible.length} 条`;
 
   if (tlSub === "pf") {
-    const tbody = $("tlTable").querySelector("tbody");
+    const tbody = $("tlTable") && $("tlTable").querySelector("tbody");
+    if (!tbody) return;
     tbody.innerHTML = pfRows.map(({ node, a, cs }) => {
     const dev = devMap[node];
     const relay = a.specRelayNode
@@ -695,7 +703,8 @@ function renderTunnels() {
     </tr>`;
     }).join("") || `<tr><td colspan="11" class="muted" style="text-align:center">无端口转发规则</td></tr>`;
   } else {
-    const tbody = $("sdTable").querySelector("tbody");
+    const tbody = $("sdTable") && $("sdTable").querySelector("tbody");
+    if (!tbody) return;
     tbody.innerHTML = sdRows.map(({ node, a, cs }) => {
     const dev = devMap[node];
     const peerDev = devMap[a.peerNode];
@@ -718,7 +727,7 @@ function renderTunnels() {
   // 排序列头箭头（两张表各自处理）
   document.querySelectorAll("#tlTable th.sortable, #sdTable th.sortable").forEach((th) => {
     const arrow = th.querySelector(".sort-arrow");
-    arrow.textContent = tunnelSort.key === th.dataset.sort ? (tunnelSort.dir === 1 ? " ▲" : " ▼") : "";
+    if (arrow) arrow.textContent = tunnelSort.key === th.dataset.sort ? (tunnelSort.dir === 1 ? " ▲" : " ▼") : "";
     th.classList.toggle("sorted", tunnelSort.key === th.dataset.sort);
   });
 
