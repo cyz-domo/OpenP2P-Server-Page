@@ -1,14 +1,14 @@
 /**
  * OpenP2P 管理面板 — EdgeOne Makers API 处理器
- * 匹配 /api/* 路由
+ * 包含 AES-GCM 会话加密、SSRF 内网拦截、防重放验证码与安全响应头
  */
 
 const DEFAULT_UPSTREAM = "https://console.openpxp.com";
 const SESSION_COOKIE_NAME = "openp2p_session";
 const SESSION_TTL = 30 * 24 * 3600; // 30天
-const DEFAULT_SECRET = "openp2p-edgeone-secret-key-32bytes-min";
+const DEFAULT_SECRET = "openp2p-edgeone-aes-secret-key-32bytes-v2";
 
-/* ---------------- 基础工具与加密 ---------------- */
+/* ---------------- 基础工具与 Base64 ---------------- */
 function base64UrlEncode(strOrBuffer) {
   let bytes = typeof strOrBuffer === "string" ? new TextEncoder().encode(strOrBuffer) : new Uint8Array(strOrBuffer);
   let binary = "";
@@ -18,7 +18,7 @@ function base64UrlEncode(strOrBuffer) {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function base64UrlDecode(str) {
+function base64UrlDecodeBytes(str) {
   let base64 = str.replace(/-/g, "+").replace(/_/g, "/");
   while (base64.length % 4) base64 += "=";
   let binary = atob(base64);
@@ -26,7 +26,48 @@ function base64UrlDecode(str) {
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
-  return new TextDecoder().decode(bytes);
+  return bytes;
+}
+
+function base64UrlDecode(str) {
+  return new TextDecoder().decode(base64UrlDecodeBytes(str));
+}
+
+/* ---------------- AES-GCM-256 加密存储与 HMAC 签名 ---------------- */
+async function getDerivedAesKey(secret) {
+  const enc = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey("raw", enc.encode(secret || DEFAULT_SECRET), "PBKDF2", false, ["deriveKey"]);
+  return await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: enc.encode("openp2p-salt-2026"), iterations: 10000, hash: "SHA-256" },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptData(plainText, secret) {
+  const key = await getDerivedAesKey(secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plainText));
+  const combined = new Uint8Array(iv.byteLength + encrypted.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(encrypted), iv.byteLength);
+  return base64UrlEncode(combined);
+}
+
+async function decryptData(cipherB64, secret) {
+  try {
+    const raw = base64UrlDecodeBytes(cipherB64);
+    if (raw.byteLength <= 12) return null;
+    const iv = raw.slice(0, 12);
+    const data = raw.slice(12);
+    const key = await getDerivedAesKey(secret);
+    const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
+    return new TextDecoder().decode(decrypted);
+  } catch {
+    return null;
+  }
 }
 
 async function getHmacKey(secret) {
@@ -51,17 +92,41 @@ async function verifyData(signedStr, secret) {
   try {
     const rawData = base64UrlDecode(b64Data);
     const key = await getHmacKey(secret);
-    
-    let sigBase64 = b64Sig.replace(/-/g, "+").replace(/_/g, "/");
-    while (sigBase64.length % 4) sigBase64 += "=";
-    let sigBin = atob(sigBase64);
-    let sigBytes = new Uint8Array(sigBin.length);
-    for (let i = 0; i < sigBin.length; i++) sigBytes[i] = sigBin.charCodeAt(i);
-
+    const sigBytes = base64UrlDecodeBytes(b64Sig);
     const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(rawData));
     return valid ? rawData : null;
   } catch {
     return null;
+  }
+}
+
+/* ---------------- SSRF 内网地址检测 ---------------- */
+function isPrivateHost(hostname) {
+  if (!hostname) return true;
+  hostname = hostname.toLowerCase().trim();
+  if (hostname === "localhost" || hostname.endsWith(".local") || hostname.endsWith(".internal")) return true;
+  const parts = hostname.split(".");
+  if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) {
+    const [a, b, c, d] = parts.map(Number);
+    if (a === 127) return true; // 127.0.0.0/8
+    if (a === 10) return true;  // 10.0.0.0/8
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16 (Link-Local & Cloud Metadata)
+    if (a === 0 || a >= 224) return true; // 0.0.0.0/8, Multicast & Reserved
+  }
+  if (hostname === "::1" || hostname.startsWith("fe80:") || hostname.startsWith("fc00:") || hostname.startsWith("fd00:")) return true;
+  return false;
+}
+
+function validateUpstreamUrl(urlStr) {
+  try {
+    const parsed = new URL(urlStr);
+    if (parsed.protocol !== "https:") return { valid: false, reason: "上游地址必须使用 HTTPS 协议" };
+    if (isPrivateHost(parsed.hostname)) return { valid: false, reason: "禁止使用私有内网或云平台元数据 IP 地址" };
+    return { valid: true, url: parsed.origin };
+  } catch {
+    return { valid: false, reason: "上游地址格式不合法" };
   }
 }
 
@@ -93,7 +158,6 @@ function generateCaptchaSvg(code, theme = "dark") {
     ? ["#0d9e73", "#b07d1a", "#3d7fb8", "#8a5cb8"]
     : ["#35d9a4", "#e8b64c", "#7db4e8", "#c98ce8"];
 
-  const W = 120, H = 44;
   let chars = "";
   for (let i = 0; i < code.length; i++) {
     const x = 21 + i * 26;
@@ -128,11 +192,15 @@ async function getSession(request, env) {
   const rawCookie = cookies[SESSION_COOKIE_NAME] || request.headers.get("X-Session-Id");
   if (!rawCookie) return { accounts: [], activeUser: "", upstream: (env && env.UPSTREAM_URL) || DEFAULT_UPSTREAM };
 
-  const verified = await verifyData(rawCookie, secret);
-  if (!verified) return { accounts: [], activeUser: "", upstream: (env && env.UPSTREAM_URL) || DEFAULT_UPSTREAM };
+  // 优先解密 AES-GCM 密文；兼容旧版 HMAC 签名
+  let decryptedStr = await decryptData(rawCookie, secret);
+  if (!decryptedStr) {
+    decryptedStr = await verifyData(rawCookie, secret);
+  }
+  if (!decryptedStr) return { accounts: [], activeUser: "", upstream: (env && env.UPSTREAM_URL) || DEFAULT_UPSTREAM };
 
   try {
-    const session = JSON.parse(verified);
+    const session = JSON.parse(decryptedStr);
     if (!session.upstream) session.upstream = (env && env.UPSTREAM_URL) || DEFAULT_UPSTREAM;
     return session;
   } catch {
@@ -142,15 +210,22 @@ async function getSession(request, env) {
 
 async function createSessionCookie(sessionData, env) {
   const secret = (env && env.SESSION_SECRET) || DEFAULT_SECRET;
-  const signed = await signData(JSON.stringify(sessionData), secret);
-  return `${SESSION_COOKIE_NAME}=${encodeURIComponent(signed)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; SameSite=Lax; Secure`;
+  const encrypted = await encryptData(JSON.stringify(sessionData), secret);
+  return `${SESSION_COOKIE_NAME}=${encodeURIComponent(encrypted)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; SameSite=Lax; Secure`;
 }
 
-function jsonRsp(data, status = 200, headers = {}) {
-  const h = new Headers(headers);
+function applySecurityHeaders(headers) {
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+}
+
+function jsonRsp(data, status = 200, extraHeaders = {}) {
+  const h = new Headers(extraHeaders);
   h.set("Content-Type", "application/json; charset=utf-8");
   h.set("Cache-Control", "no-store, no-cache, must-revalidate");
-  h.set("X-Content-Type-Options", "nosniff");
+  applySecurityHeaders(h);
   return new Response(JSON.stringify(data), { status, headers: h });
 }
 
@@ -193,18 +268,19 @@ export async function onRequest(context) {
     });
   }
 
-  // 2. 验证码接口 (支持 GET 与 POST)
+  // 2. 验证码接口 (有效期缩短至 2 分钟，防重放时间窗口)
   if (pathname === "/api/captcha" && (method === "GET" || method === "POST")) {
     const secret = env.SESSION_SECRET || DEFAULT_SECRET;
     const theme = url.searchParams.get("theme") || request.headers.get("X-Panel-Theme") || "dark";
     const code = Math.floor(1000 + Math.random() * 9000).toString();
-    const cid = await signData(JSON.stringify({ code, exp: Date.now() + 300000 }), secret);
+    const nonce = Math.random().toString(36).slice(2, 8);
+    const cid = await signData(JSON.stringify({ code, nonce, exp: Date.now() + 120000 }), secret);
     const svg = generateCaptchaSvg(code, theme);
     return jsonRsp({ captcha_id: cid, captchaId: cid, svg });
   }
 
-  // 3. 登录接口
-  if (pathname === "/api/login" && method === "POST") {
+  // 3. 登录接口 (支持账号密码与 Token 登录)
+  if ((pathname === "/api/login" || pathname === "/api/login-token") && method === "POST") {
     const secret = env.SESSION_SECRET || DEFAULT_SECRET;
     let body;
     try {
@@ -229,19 +305,30 @@ export async function onRequest(context) {
       }
     }
 
+    const token = (body.token || "").trim();
+    const user = (body.user || "").trim();
+    const password = body.password || "";
+    const customUp = (body.upstream || "").trim().replace(/\/+$/, "");
+    if (customUp) {
+      const upCheck = validateUpstreamUrl(customUp);
+      if (!upCheck.valid) return jsonRsp({ error: -1, detail: upCheck.reason }, 400);
+      session.upstream = upCheck.url;
+    }
+    const activeUpstream = session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
+
     // Token 登录
     if (token) {
-      const profRsp = await fetch(`${upstream}/api/v1/user/profile`, {
+      const profRsp = await fetch(`${activeUpstream}/api/v1/user/profile`, {
         method: "POST",
         headers: { Authorization: token, "Content-Type": "application/json" },
         body: "{}",
       });
-      const profData = await profRsp.json();
+      const profData = await profRsp.json().catch(() => ({ error: -1 }));
       if (profData.error !== 0) {
         return jsonRsp({ error: -1, detail: "Token 无效或已失效" }, 401);
       }
       const loginUser = profData.user || jwtUser(token);
-      const pool = session.accounts.filter((a) => a.user !== loginUser);
+      const pool = (session.accounts || []).filter((a) => a.user !== loginUser);
       pool.push({ user: loginUser, token, password: "" });
       session.accounts = pool;
       session.activeUser = loginUser;
@@ -252,15 +339,15 @@ export async function onRequest(context) {
 
     // 账号密码登录
     if (user && password) {
-      const loginRsp = await fetch(`${upstream}/api/v1/user/login`, {
+      const loginRsp = await fetch(`${activeUpstream}/api/v1/user/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ user, password }),
       });
-      const loginData = await loginRsp.json();
+      const loginData = await loginRsp.json().catch(() => ({ error: -1 }));
       if (loginData.error === 0 && loginData.token) {
         const loginUser = loginData.user || user;
-        const pool = session.accounts.filter((a) => a.user !== loginUser);
+        const pool = (session.accounts || []).filter((a) => a.user !== loginUser);
         pool.push({ user: loginUser, token: loginData.token, password });
         session.accounts = pool;
         session.activeUser = loginUser;
@@ -294,16 +381,29 @@ export async function onRequest(context) {
     return jsonRsp({ error: 0, user: targetUser }, 200, { "Set-Cookie": cookie });
   }
 
-  // 6. 切换上游官方域名
+  // 6. 移除账户
+  if (pathname === "/api/accounts/remove" && method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const targetUser = body.user;
+    session.accounts = (session.accounts || []).filter((a) => a.user !== targetUser);
+    if (session.activeUser === targetUser) {
+      session.activeUser = session.accounts.length > 0 ? session.accounts[0].user : "";
+    }
+    const cookie = await createSessionCookie(session, env);
+    return jsonRsp({ error: 0, ok: true }, 200, { "Set-Cookie": cookie });
+  }
+
+  // 7. 切换上游官方域名 (严格 SSRF 防护)
   if (pathname === "/api/upstream" && method === "POST") {
     const body = await request.json().catch(() => ({}));
     const newUp = (body.upstream || "").trim().replace(/\/+$/, "");
-    if (newUp.startsWith("http://") || newUp.startsWith("https://")) {
-      session.upstream = newUp;
-      const cookie = await createSessionCookie(session, env);
-      return jsonRsp({ error: 0, upstream: newUp }, 200, { "Set-Cookie": cookie });
+    const upCheck = validateUpstreamUrl(newUp);
+    if (!upCheck.valid) {
+      return jsonRsp({ error: -1, detail: upCheck.reason }, 400);
     }
-    return jsonRsp({ error: -1, detail: "地址必须以 http:// 或 https:// 开头" }, 400);
+    session.upstream = upCheck.url;
+    const cookie = await createSessionCookie(session, env);
+    return jsonRsp({ error: 0, upstream: upCheck.url }, 200, { "Set-Cookie": cookie });
   }
 
   return jsonRsp({ error: -1, detail: "未知接口" }, 404);

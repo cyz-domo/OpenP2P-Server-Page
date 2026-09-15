@@ -1,13 +1,15 @@
 /**
  * OpenP2P 管理面板 — EdgeOne Makers 反向代理处理器
  * 匹配 /pxp/* 路由并代理转发至 OpenP2P 官方控制台
+ * 集成 AES-GCM 会话解密、SSRF 拦截与安全响应头
  */
 
 const DEFAULT_UPSTREAM = "https://console.openpxp.com";
 const SESSION_COOKIE_NAME = "openp2p_session";
-const DEFAULT_SECRET = "openp2p-edgeone-secret-key-32bytes-min";
+const DEFAULT_SECRET = "openp2p-edgeone-aes-secret-key-32bytes-v2";
 
-function base64UrlDecode(str) {
+/* ---------------- 基础工具与 Base64 ---------------- */
+function base64UrlDecodeBytes(str) {
   let base64 = str.replace(/-/g, "+").replace(/_/g, "/");
   while (base64.length % 4) base64 += "=";
   let binary = atob(base64);
@@ -15,17 +17,38 @@ function base64UrlDecode(str) {
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
-  return new TextDecoder().decode(bytes);
+  return bytes;
 }
 
-async function getHmacKey(secret) {
-  return await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret || DEFAULT_SECRET),
-    { name: "HMAC", hash: "SHA-256" },
+function base64UrlDecode(str) {
+  return new TextDecoder().decode(base64UrlDecodeBytes(str));
+}
+
+/* ---------------- AES-GCM-256 解密与 HMAC 校验 ---------------- */
+async function getDerivedAesKey(secret) {
+  const enc = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey("raw", enc.encode(secret || DEFAULT_SECRET), "PBKDF2", false, ["deriveKey"]);
+  return await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: enc.encode("openp2p-salt-2026"), iterations: 10000, hash: "SHA-256" },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
     false,
-    ["sign", "verify"]
+    ["decrypt"]
   );
+}
+
+async function decryptData(cipherB64, secret) {
+  try {
+    const raw = base64UrlDecodeBytes(cipherB64);
+    if (raw.byteLength <= 12) return null;
+    const iv = raw.slice(0, 12);
+    const data = raw.slice(12);
+    const key = await getDerivedAesKey(secret);
+    const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
+    return new TextDecoder().decode(decrypted);
+  } catch {
+    return null;
+  }
 }
 
 async function verifyData(signedStr, secret) {
@@ -33,19 +56,35 @@ async function verifyData(signedStr, secret) {
   const [b64Data, b64Sig] = signedStr.split(".");
   try {
     const rawData = base64UrlDecode(b64Data);
-    const key = await getHmacKey(secret);
-    
-    let sigBase64 = b64Sig.replace(/-/g, "+").replace(/_/g, "/");
-    while (sigBase64.length % 4) sigBase64 += "=";
-    let sigBin = atob(sigBase64);
-    let sigBytes = new Uint8Array(sigBin.length);
-    for (let i = 0; i < sigBin.length; i++) sigBytes[i] = sigBin.charCodeAt(i);
-
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secret || DEFAULT_SECRET),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"]
+    );
+    const sigBytes = base64UrlDecodeBytes(b64Sig);
     const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(rawData));
     return valid ? rawData : null;
   } catch {
     return null;
   }
+}
+
+/* ---------------- SSRF 校验 ---------------- */
+function isPrivateHost(hostname) {
+  if (!hostname) return true;
+  hostname = hostname.toLowerCase().trim();
+  if (hostname === "localhost" || hostname.endsWith(".local") || hostname.endsWith(".internal")) return true;
+  const parts = hostname.split(".");
+  if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) {
+    const [a, b, c, d] = parts.map(Number);
+    if (a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 0 || a >= 224) {
+      return true;
+    }
+  }
+  if (hostname === "::1" || hostname.startsWith("fe80:") || hostname.startsWith("fc00:") || hostname.startsWith("fd00:")) return true;
+  return false;
 }
 
 function parseJwt(token) {
@@ -79,11 +118,14 @@ async function getSession(request, env) {
   const rawCookie = cookies[SESSION_COOKIE_NAME] || request.headers.get("X-Session-Id");
   if (!rawCookie) return { accounts: [], activeUser: "", upstream: (env && env.UPSTREAM_URL) || DEFAULT_UPSTREAM };
 
-  const verified = await verifyData(rawCookie, secret);
-  if (!verified) return { accounts: [], activeUser: "", upstream: (env && env.UPSTREAM_URL) || DEFAULT_UPSTREAM };
+  let decryptedStr = await decryptData(rawCookie, secret);
+  if (!decryptedStr) {
+    decryptedStr = await verifyData(rawCookie, secret);
+  }
+  if (!decryptedStr) return { accounts: [], activeUser: "", upstream: (env && env.UPSTREAM_URL) || DEFAULT_UPSTREAM };
 
   try {
-    const session = JSON.parse(verified);
+    const session = JSON.parse(decryptedStr);
     if (!session.upstream) session.upstream = (env && env.UPSTREAM_URL) || DEFAULT_UPSTREAM;
     return session;
   } catch {
@@ -91,10 +133,18 @@ async function getSession(request, env) {
   }
 }
 
+function applySecurityHeaders(headers) {
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+}
+
 function jsonRsp(data, status = 200) {
   const h = new Headers();
   h.set("Content-Type", "application/json; charset=utf-8");
   h.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  applySecurityHeaders(h);
   return new Response(JSON.stringify(data), { status, headers: h });
 }
 
@@ -114,9 +164,19 @@ export async function onRequest(context) {
   }
 
   const session = await getSession(request, env);
-  const upstream = session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
-  const subPath = pathname.slice(4); // 去除 /pxp 前缀
+  let upstream = session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
+  
+  // SSRF 防护检查
+  try {
+    const upUrl = new URL(upstream);
+    if (upUrl.protocol !== "https:" || isPrivateHost(upUrl.hostname)) {
+      upstream = DEFAULT_UPSTREAM;
+    }
+  } catch {
+    upstream = DEFAULT_UPSTREAM;
+  }
 
+  const subPath = pathname.slice(4); // 去除 /pxp 前缀
   const acc = (session.accounts || []).find((a) => a.user === session.activeUser);
   let token = acc ? acc.token : "";
 
@@ -152,6 +212,7 @@ export async function onRequest(context) {
 
     const respHeaders = new Headers(upstreamRsp.headers);
     respHeaders.set("Cache-Control", "no-store");
+    applySecurityHeaders(respHeaders);
     return new Response(upstreamRsp.body, {
       status: upstreamRsp.status,
       headers: respHeaders,
