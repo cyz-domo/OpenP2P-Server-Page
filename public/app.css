@@ -1005,6 +1005,50 @@ body {
   background-image: linear-gradient(var(--row-hover), var(--row-hover));
 }
 
+/* ================= 敏感信息隐私打码系统 (Privacy Masking) ================= */
+[data-privacy="masked"] .ip,
+[data-privacy="masked"] .col-name span,
+[data-privacy="masked"] .user-text,
+[data-privacy="masked"] .acct-item-user,
+[data-privacy="masked"] .privacy-mask,
+[data-privacy="masked"] .cmd-block code,
+[data-privacy="masked"] #setCurUpstream,
+[data-privacy="masked"] .token-val {
+  filter: blur(5.5px) !important;
+  opacity: 0.65;
+  user-select: none;
+  cursor: pointer;
+  transition: filter 0.25s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease;
+}
+
+/* 悬停临时透视预览（鼠标移至目标上方可临时看清，移开自动恢复打码） */
+[data-privacy="masked"] .ip:hover,
+[data-privacy="masked"] .col-name:hover span,
+[data-privacy="masked"] .user-text:hover,
+[data-privacy="masked"] .acct-item-user:hover,
+[data-privacy="masked"] .privacy-mask:hover,
+[data-privacy="masked"] .cmd-block code:hover,
+[data-privacy="masked"] #setCurUpstream:hover,
+[data-privacy="masked"] .token-val:hover {
+  filter: blur(0) !important;
+  opacity: 1 !important;
+  user-select: auto;
+}
+
+/* 复制按钮与图标在隐私模式下保持高亮可点 */
+[data-privacy="masked"] .copy-mini,
+[data-privacy="masked"] .copy-btn {
+  filter: none !important;
+  opacity: 0.8 !important;
+}
+
+#btnPrivacy.active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: 0 0 10px var(--accent-dim);
+}
+
 /* 可复制数值 Copyable */
 .copyable {
   display: inline-flex;

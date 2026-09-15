@@ -1992,6 +1992,35 @@ if ($("btnLoginTheme")) {
 }
 applyTheme(localStorage.getItem("panelTheme") || "dark");
 
+/* ---------------- 敏感信息打码（隐私模式） ---------------- */
+function applyPrivacyMode(masked) {
+  if (masked) {
+    document.documentElement.dataset.privacy = "masked";
+    localStorage.setItem("panelPrivacyMode", "true");
+    if ($("btnPrivacy")) {
+      $("btnPrivacy").classList.add("active");
+      $("btnPrivacy").title = "隐私模式已开启（敏感信息已打码，悬停可临时透视，点击解除）";
+      $("btnPrivacy").textContent = "🙈";
+    }
+  } else {
+    delete document.documentElement.dataset.privacy;
+    localStorage.setItem("panelPrivacyMode", "false");
+    if ($("btnPrivacy")) {
+      $("btnPrivacy").classList.remove("active");
+      $("btnPrivacy").title = "点击开启隐私模式（自动打码 IP 与敏感设备信息）";
+      $("btnPrivacy").textContent = "👁️";
+    }
+  }
+}
+if ($("btnPrivacy")) {
+  $("btnPrivacy").addEventListener("click", () => {
+    const isMasked = document.documentElement.dataset.privacy === "masked";
+    applyPrivacyMode(!isMasked);
+    toast(!isMasked ? "🙈 隐私模式已开启：IP与敏感信息已自动打码（悬停可临时透视）" : "👁️ 隐私模式已关闭：显示明文信息", "ok");
+  });
+}
+applyPrivacyMode(localStorage.getItem("panelPrivacyMode") === "true");
+
 if ($("linkCancelLogin")) {
   $("linkCancelLogin").addEventListener("click", () => {
     $("loginView").classList.add("hidden");
