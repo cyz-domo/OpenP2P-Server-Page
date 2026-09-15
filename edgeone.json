@@ -1,0 +1,15 @@
+{
+  "name": "openp2p-panel",
+  "framework": "static",
+  "distDir": "public",
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/edge-functions/index.js"
+    },
+    {
+      "src": "/pxp/(.*)",
+      "dest": "/edge-functions/index.js"
+    }
+  ]
+}
