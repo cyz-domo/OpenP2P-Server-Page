@@ -901,6 +901,82 @@ body {
   font-size: 12px;
 }
 
+/* ================= 设备列表固定列 Sticky Columns ================= */
+.tbl-sticky-dev thead th.col-chk,
+.tbl-sticky-dev tbody td.col-chk {
+  position: sticky;
+  left: 0;
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+  text-align: center;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.tbl-sticky-dev thead th.col-status,
+.tbl-sticky-dev tbody td.col-status {
+  position: sticky;
+  left: 44px;
+  width: 86px;
+  min-width: 86px;
+  max-width: 86px;
+}
+
+.tbl-sticky-dev thead th.col-name,
+.tbl-sticky-dev tbody td.col-name {
+  position: sticky;
+  left: 130px;
+  min-width: 140px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 固定列末尾右侧阴影与清晰分界线（向右滑动时其他内容平滑钻入下方） */
+.tbl-sticky-dev thead th.col-pinned-end,
+.tbl-sticky-dev tbody td.col-pinned-end {
+  border-right: 1px solid var(--line-strong) !important;
+  box-shadow: 4px 0 8px -2px rgba(0, 0, 0, 0.35);
+}
+
+:root[data-theme="light"] .tbl-sticky-dev thead th.col-pinned-end,
+:root[data-theme="light"] .tbl-sticky-dev tbody td.col-pinned-end {
+  box-shadow: 4px 0 8px -2px rgba(0, 0, 0, 0.08);
+}
+
+/* 顶部表头 Sticky：层级最高，防止横纵同时滚动时交叉重叠 */
+.tbl-sticky-dev thead th.col-chk,
+.tbl-sticky-dev thead th.col-status,
+.tbl-sticky-dev thead th.col-name {
+  top: 0;
+  z-index: 5;
+  background-color: var(--panel2);
+}
+
+/* 表体数据行 Sticky：层级高于普通单元格，使用复合底色确保不透明且完美贴合隔行变色与 Hover */
+.tbl-sticky-dev tbody tr td.col-chk,
+.tbl-sticky-dev tbody tr td.col-status,
+.tbl-sticky-dev tbody tr td.col-name {
+  z-index: 3;
+  background-color: var(--panel);
+}
+
+.tbl-sticky-dev tbody tr:nth-child(even) td.col-chk,
+.tbl-sticky-dev tbody tr:nth-child(even) td.col-status,
+.tbl-sticky-dev tbody tr:nth-child(even) td.col-name {
+  background-color: var(--panel);
+  background-image: linear-gradient(var(--row-alt), var(--row-alt));
+}
+
+.tbl-sticky-dev tbody tr:hover td.col-chk,
+.tbl-sticky-dev tbody tr:hover td.col-status,
+.tbl-sticky-dev tbody tr:hover td.col-name {
+  background-color: var(--panel);
+  background-image: linear-gradient(var(--row-hover), var(--row-hover));
+}
+
 /* 可复制数值 Copyable */
 .copyable {
   display: inline-flex;
@@ -1779,6 +1855,28 @@ dialog form {
   }
   .tbl th, .tbl td {
     padding: 9px 12px;
+  }
+  .tbl-sticky-dev thead th.col-chk,
+  .tbl-sticky-dev tbody td.col-chk {
+    width: 36px;
+    min-width: 36px;
+    max-width: 36px;
+    padding: 9px 4px;
+  }
+  .tbl-sticky-dev thead th.col-status,
+  .tbl-sticky-dev tbody td.col-status {
+    left: 36px;
+    width: 76px;
+    min-width: 76px;
+    max-width: 76px;
+    padding: 9px 6px;
+  }
+  .tbl-sticky-dev thead th.col-name,
+  .tbl-sticky-dev tbody td.col-name {
+    left: 112px;
+    min-width: 110px;
+    max-width: 150px;
+    padding: 9px 8px;
   }
 
   /* 虚拟网络卡片与表单 */
