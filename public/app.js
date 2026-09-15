@@ -782,15 +782,22 @@ async function refreshAll(force = false) {
   }
 }
 
-/** 并发受限拉取所有在线设备的规则列表（最大并发4，防止瞬间占用过多连接池）。
+/** 并发受限拉取所有在线设备的规则列表（最大并发3，配合 15s SWR 缓存大幅减负源站）。
  *  端口转发来自 subtype=7（本机发起的隧道应用）；
  *  组网隧道全拓扑来自 subtype=17（成员视角，含未活跃对端）——两者合并去重，并同步填充成员状态缓存。 */
 let _refreshingTunnels = false;
 let _lastRefreshTunnelsTs = 0;
+let _tunnelsCacheTs = 0;
 
-async function refreshTunnels(quiet = false) {
-  if (_refreshingTunnels) return;
+async function refreshTunnels(quiet = false, force = false) {
   const now = Date.now();
+  // 15s SWR 快照：若未强制刷新且已有数据在 15s 内，直接复用内存渲染，0ms 响应不向源站发包
+  if (!force && Object.keys(state.tunnelByNode || {}).length > 0 && (now - _tunnelsCacheTs < 15000)) {
+    renderTunnels();
+    if (state.selView === "networks") renderNetwork();
+    return;
+  }
+  if (_refreshingTunnels) return;
   if (now - _lastRefreshTunnelsTs < 1500 && quiet) return;
   _lastRefreshTunnelsTs = now;
   _refreshingTunnels = true;
@@ -799,15 +806,16 @@ async function refreshTunnels(quiet = false) {
     const online = state.devices.filter(onlineDev);
     if (!online.length) {
       state.tunnelByNode = {};
+      _tunnelsCacheTs = now;
       renderTunnels();
       return;
     }
     if (!quiet) toast(`正在拉取 ${online.length} 台在线设备的规则…`);
 
-    // 采用受限并发池（限制同时最多 4 个长轮询连接），避免瞬间打满源站连接池
+    // 限制同时最多 3 个长轮询连接，大幅降低源站并发突发压力
     const [r7, r17] = await Promise.all([
-      runBatchLimit(online.map((d) => () => pushCmd(d.name, 7, {}, 1)), 4),
-      runBatchLimit(online.map((d) => () => pushCmd(d.name, 17, {}, 1)), 4),
+      runBatchLimit(online.map((d) => () => pushCmd(d.name, 7, {}, 1)), 3),
+      runBatchLimit(online.map((d) => () => pushCmd(d.name, 17, {}, 1)), 3),
     ]);
 
     const map = {};
@@ -819,13 +827,12 @@ async function refreshTunnels(quiet = false) {
 
     for (let i = 0; i < online.length; i++) {
       const apps = get(r7, i);
-      if (apps) put(i, apps.filter((a) => a.srcPort)); // subtype=7 只保留端口转发
+      if (apps) put(i, apps.filter((a) => a.srcPort));
     }
 
     for (let i = 0; i < online.length; i++) {
       const mem = get(r17, i);
       if (!mem) continue;
-      // 同步直接填充 state.memByNode 缓存，避免重复发起 loadMemStatus
       state.memByNode[online[i].name] = mem;
       const existing = new Set(map[online[i].name].map((a) => a.peerNode + "|" + (a.appName || "")));
       for (const a of mem) {
@@ -835,6 +842,7 @@ async function refreshTunnels(quiet = false) {
     }
 
     state.tunnelByNode = map;
+    _tunnelsCacheTs = Date.now();
     renderTunnels();
     if (state.selView === "networks") renderNetwork();
     if (!quiet) toast("规则已刷新", "ok");
