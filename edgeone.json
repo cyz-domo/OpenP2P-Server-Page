@@ -1,4 +1,4 @@
 {
   "name": "openp2p-panel",
-  "distDir": "public"
+  "outputDirectory": "public"
 }
