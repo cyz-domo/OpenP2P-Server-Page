@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OpenP2P 管理面板</title>
-<link rel="stylesheet" href="app.css?v=20260914k">
+<link rel="stylesheet" href="app.css?v=20260915u">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%2310b981%22 stroke-width=%222%22><circle cx=%2212%22 cy=%225%22 r=%222.2%22/><circle cx=%225%22 cy=%2219%22 r=%222.2%22/><circle cx=%2219%22 cy=%2219%22 r=%222.2%22/><path d=%22M11 7l-5 10M13 7l5 10M7.2 19h9.6%22/></svg>">
 </head>
 <body>
 <div id="app">
   <!-- 顶栏 -->
-  <header class="topbar">
+  <header id="topBar" class="topbar hidden">
     <div class="brand">
       <div class="brand-logo">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
@@ -53,6 +53,9 @@
   <section id="loginView" class="login-wrap hidden">
     <div class="login-ambient"></div>
     <form id="loginForm" class="login-card">
+      <div class="login-card-top">
+        <button type="button" id="btnLoginTheme" class="btn ghost icon-btn" title="切换深色/浅色主题">🌙</button>
+      </div>
       <div class="login-header">
         <div class="login-icon">
           <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="2.2"/><circle cx="5" cy="19" r="2.2"/><circle cx="19" cy="19" r="2.2"/><path d="M11 7l-5 10M13 7l5 10M7.2 19h9.6"/></svg>
@@ -107,7 +110,7 @@
           <span class="label-text">图形验证码</span>
           <input id="loginCaptcha" class="input captcha-input" maxlength="4" autocomplete="off" placeholder="输入数字">
         </label>
-        <div class="captcha-img-wrap" title="点击刷新验证码">
+        <div id="captchaWrap" class="captcha-img-wrap" title="点击刷新验证码">
           <img id="captchaImg" class="captcha-img" alt="验证码，点击刷新">
           <span class="captcha-hint">刷新</span>
         </div>
@@ -115,7 +118,10 @@
 
       <div id="loginErr" class="err hidden"></div>
       <button class="btn primary block btn-lg" type="submit">立即登录</button>
-      <p style="text-align:center;margin:0"><a href="javascript:" id="linkForgot" style="color:var(--muted);font-size:12.5px">忘记密码？</a></p>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:2px">
+        <a href="javascript:" id="linkCancelLogin" class="hidden" style="color:var(--muted);font-size:12.5px">← 返回控制台</a>
+        <a href="javascript:" id="linkForgot" style="color:var(--muted);font-size:12.5px;margin-left:auto">忘记密码？</a>
+      </div>
     </form>
   </section>
 
@@ -571,6 +577,14 @@
       <h3>批量加入设备到虚拟网络</h3>
       <p class="muted">勾选要加入的节点，确认后将自动分配虚拟 IP 并全量下发</p>
     </div>
+    <div class="md-tools">
+      <div class="search-input-wrap">
+        <svg class="search-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input id="mdSearch" class="input input-search" placeholder="搜索待加入设备名 / IP / 系统…">
+      </div>
+      <label class="chk toggle-chk"><input id="mdChkAll" type="checkbox"> <span>全选过滤项</span></label>
+      <span id="mdCount" class="counter-badge">已选 0 台</span>
+    </div>
     <div id="mdList" class="md-list"></div>
     <div class="dlg-actions">
       <button type="button" class="btn ghost" id="mdCancel">取消</button>
@@ -652,6 +666,6 @@
 <!-- 悬浮 Toast 消息 -->
 <div id="toast" class="hidden"></div>
 
-<script src="app.js?v=20260914k"></script>
+<script src="app.js?v=20260915u"></script>
 </body>
 </html>

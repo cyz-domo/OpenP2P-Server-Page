@@ -108,8 +108,11 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    tighten_config_perm()
+    try:
+        CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        tighten_config_perm()
+    except Exception:
+        pass
 
 
 def tighten_config_perm() -> None:
@@ -163,7 +166,7 @@ def new_captcha(theme: str = "dark") -> tuple[str, str]:
 
 
 def captcha_svg(code: str, theme: str = "dark") -> str:
-    """无第三方依赖的 SVG 验证码：随机旋转/位移/干扰线，噪声足够人读机难猜。配色跟随面板主题。"""
+    """无第三方依赖的 SVG 验证码：居中排列/防截断/干扰线，配色跟随面板主题。"""
     import random
 
     if theme == "light":
@@ -176,13 +179,13 @@ def captcha_svg(code: str, theme: str = "dark") -> str:
     W, H = 120, 44
     chars = []
     for i, ch in enumerate(code):
-        x = 14 + i * 26 + rnd.randint(-3, 3)
-        y = 30 + rnd.randint(-4, 4)
-        rot = rnd.randint(-24, 24)
+        x = 21 + i * 26 + rnd.randint(-2, 2)
+        y = 31 + rnd.randint(-2, 2)
+        rot = rnd.randint(-16, 16)
         color = rnd.choice(colors)
         chars.append(
-            f'<text x="{x}" y="{y}" transform="rotate({rot} {x} {y})" '
-            f'font-family="Consolas,monospace" font-size="26" font-weight="bold" '
+            f'<text x="{x}" y="{y}" text-anchor="middle" transform="rotate({rot} {x} {y})" '
+            f'font-family="Consolas,monospace" font-size="24" font-weight="bold" '
             f'fill="{color}">{ch}</text>'
         )
     lines = []
@@ -191,7 +194,7 @@ def captcha_svg(code: str, theme: str = "dark") -> str:
         lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{noise}" stroke-width="1"/>')
     dots = "".join(
         f'<circle cx="{rnd.randint(0, W)}" cy="{rnd.randint(0, H)}" r="1" fill="{noise}"/>'
-        for _ in range(18)
+        for _ in range(16)
     )
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">'
             f'<rect width="{W}" height="{H}" fill="{bg}" rx="6"/>{"".join(lines)}{dots}{"".join(chars)}</svg>')
@@ -258,79 +261,89 @@ def migrate_accounts(cfg: dict) -> None:
     cfg["activeUser"] = user
 
 
-class Upstream:
-    """官方控制台客户端：多账户 token 池 + 自动重登 + 账户切换。
+# ---------- Session 管理与多用户隔离 ----------
+SESSION_COOKIE_NAME = "openp2p_session"
+SESSION_TTL = 7 * 86400  # 会话 7 天有效
 
-    cfg["accounts"] = [{"user": str, "token": str, "password": str(可选)}]
-    cfg["activeUser"] = 当前生效账户；无 accounts 时回退到旧的单账户字段。
+
+class SessionManager:
+    """服务端多用户 Session 管理器：
+    - 管理每个浏览器的独立 Session，按 sessionId 隔离
+    - 每个 Session 维护独立 accounts 列表与 activeUser
+    - 7 天持久化到 config.json 中的 "sessions" 字段，服务重启会话不丢失
     """
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.lock = threading.Lock()
-        self.user = cfg.get("activeUser", "") or cfg.get("user", "")
-        self.token = cfg.get("token", "")
-        self.token_user = ""
-        migrate_accounts(cfg)
-        acc = self._active()
-        if acc:
-            self.user = acc["user"]
-            self.token = acc.get("token", "")
+        self.sessions: dict = {}
+        self._load()
 
-    # ---- 账户池 ----
-    def _pool(self) -> list:
-        return self.cfg.setdefault("accounts", [])
-
-    def _active(self) -> dict | None:
-        for a in self._pool():
-            if a["user"] == self.user:
-                return a
-        return None
-
-    def list_accounts(self) -> list:
-        """供前端展示的账户摘要（不含密码）。"""
+    def _load(self):
         with self.lock:
-            return [
-                {
-                    "user": a["user"],
-                    "hasToken": bool(a.get("token")),
-                    "tokenExp": self.jwt_exp(a.get("token", "")),
-                    "hasPassword": bool(a.get("password")),
-                    "active": a["user"] == self.user,
-                }
-                for a in self._pool()
-            ]
+            raw = self.cfg.get("sessions", {})
+            now = time.time()
+            for sid, s in raw.items():
+                if isinstance(s, dict) and s.get("exp", 0) > now:
+                    self.sessions[sid] = s
 
-    def switch_account(self, user: str) -> dict:
-        with self.lock:
-            acc = None
-            for a in self._pool():
-                if a["user"] == user:
-                    acc = a
-                    break
-            if not acc:
-                return {"error": -1, "detail": f"账户 {user} 不存在"}
-            self.user = user
-            self.token = acc.get("token", "")
-            self.cfg["activeUser"] = user
-            save_config(self.cfg)
-        return {"error": 0, "user": user}
+    def _save(self):
+        now = time.time()
+        valid = {sid: s for sid, s in self.sessions.items() if s.get("exp", 0) > now}
+        self.sessions = valid
+        self.cfg["sessions"] = valid
+        save_config(self.cfg)
 
-    def remove_account(self, user: str) -> dict:
+    def get_session(self, sid: str) -> dict | None:
+        if not sid:
+            return None
         with self.lock:
-            pool = self._pool()
-            if len(pool) <= 1:
-                return {"error": -1, "detail": "至少保留一个账户"}
-            self.cfg["accounts"] = [a for a in pool if a["user"] != user]
-            if self.user == user and self.cfg["accounts"]:
-                return self.switch_account(self.cfg["accounts"][0]["user"])
-            save_config(self.cfg)
-        return {"error": 0}
+            s = self.sessions.get(sid)
+            if not s:
+                return None
+            if s.get("exp", 0) < time.time():
+                self.sessions.pop(sid, None)
+                self._save()
+                return None
+            s["last_seen"] = time.time()
+            return s
 
-    def _store(self, user: str, token: str, password: str | None = None):
-        """写入/更新账户槽位并激活。"""
+    def create_session(self, user: str, token: str, password: str | None = None) -> str:
+        sid = secrets.token_urlsafe(32)
+        now = time.time()
         with self.lock:
-            pool = self._pool()
+            s = {
+                "sid": sid,
+                "created_at": now,
+                "last_seen": now,
+                "exp": now + SESSION_TTL,
+                "activeUser": user,
+                "accounts": [
+                    {
+                        "user": user,
+                        "token": token,
+                        "password": obf_encode(password) if password else "",
+                    }
+                ],
+            }
+            self.sessions[sid] = s
+            self._save()
+        return sid
+
+    def delete_session(self, sid: str):
+        if not sid:
+            return
+        with self.lock:
+            if sid in self.sessions:
+                self.sessions.pop(sid, None)
+                self._save()
+
+    def add_or_update_account(self, sid: str, user: str, token: str, password: str | None = None):
+        with self.lock:
+            s = self.sessions.get(sid)
+            if not s:
+                return
+            pool = s.setdefault("accounts", [])
             acc = next((a for a in pool if a["user"] == user), None)
             if not acc:
                 acc = {"user": user}
@@ -338,14 +351,46 @@ class Upstream:
             acc["token"] = token
             if password is not None:
                 acc["password"] = obf_encode(password)
-            self.user = user
-            self.token = token
-            self.token_user = self.jwt_user(token)
-            self.cfg["activeUser"] = user
-            # 兼容旧字段（单账户读取方），保持同步
-            self.cfg["user"] = user
-            self.cfg["token"] = token
-            save_config(self.cfg)
+            s["activeUser"] = user
+            s["exp"] = time.time() + SESSION_TTL
+            self._save()
+
+    def switch_account(self, sid: str, user: str) -> dict:
+        with self.lock:
+            s = self.sessions.get(sid)
+            if not s:
+                return {"error": -1, "detail": "会话不存在或已过期"}
+            pool = s.get("accounts", [])
+            acc = next((a for a in pool if a["user"] == user), None)
+            if not acc:
+                return {"error": -1, "detail": f"账户 {user} 不存在"}
+            s["activeUser"] = user
+            s["exp"] = time.time() + SESSION_TTL
+            self._save()
+        return {"error": 0, "user": user}
+
+    def remove_account(self, sid: str, user: str) -> dict:
+        with self.lock:
+            s = self.sessions.get(sid)
+            if not s:
+                return {"error": -1, "detail": "会话不存在或已过期"}
+            pool = s.get("accounts", [])
+            if len(pool) <= 1:
+                return {"error": -1, "detail": "至少保留一个账户"}
+            s["accounts"] = [a for a in pool if a["user"] != user]
+            if s.get("activeUser") == user and s["accounts"]:
+                s["activeUser"] = s["accounts"][0]["user"]
+            self._save()
+        return {"error": 0}
+
+
+class Upstream:
+    """官方控制台客户端：认证校验与代理转发。"""
+
+    def __init__(self, cfg: dict, session_mgr: SessionManager):
+        self.cfg = cfg
+        self.session_mgr = session_mgr
+        self.lock = threading.Lock()
 
     @staticmethod
     def jwt_user(token: str) -> str:
@@ -360,8 +405,6 @@ class Upstream:
     @staticmethod
     def jwt_exp(token: str) -> int:
         try:
-            import base64
-
             payload = token.split(".")[1]
             payload += "=" * (-len(payload) % 4)
             return int(json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0))
@@ -369,7 +412,7 @@ class Upstream:
             return 0
 
     def login(self, user: str, password: str) -> dict:
-        """登录官方控制台，成功后保存 token。"""
+        """登录官方控制台并返回结果与 token。"""
         body = json.dumps({"user": user, "password": password}).encode()
         req = urllib.request.Request(
             self.cfg["upstream"] + "/api/v1/user/login",
@@ -379,22 +422,17 @@ class Upstream:
         )
         try:
             with urllib.request.urlopen(req, timeout=20, context=_ssl_ctx) as rsp:
-                data = json.loads(rsp.read().decode())
+                return json.loads(rsp.read().decode())
         except urllib.error.HTTPError as e:
             return {"error": e.code, "detail": _sanitize_error(e.read().decode(errors="replace"))[:300]}
         except Exception as e:
             return {"error": -1, "detail": _sanitize_error(str(e))}
-        if data.get("error") != 0 or not data.get("token"):
-            return data
-        self._store(user, data["token"])
-        return data
 
     def login_with_token(self, token: str) -> dict:
-        """用现成 JWT 登录：先向官方验证 token 有效性，有效则入库启用。"""
+        """用现成 JWT 登录：向官方验证 token 有效性。"""
         token = token.strip()
         if not token.count(".") == 2:
             return {"error": -1, "detail": "token 格式不正确（应为 JWT）"}
-        # 用 profile 接口验证 token
         req = urllib.request.Request(
             self.cfg["upstream"] + "/api/v1/user/profile",
             data=b"{}",
@@ -410,24 +448,30 @@ class Upstream:
             return {"error": -1, "detail": _sanitize_error(str(e))}
         if data.get("error") != 0:
             return {"error": -1, "detail": "token 无效（官方校验未通过）"}
-        self._store(self.jwt_user(token), token)
-        return {"error": 0, "token": token, "user": self.user}
+        user = self.jwt_user(token)
+        return {"error": 0, "token": token, "user": user}
 
-    def ensure_token(self) -> str:
-        with self.lock:
-            token = self.token
+    def ensure_token(self, session: dict) -> str:
+        """按 session 的激活账户获取有效 token；若过期且存有密码则自动重登。"""
+        pool = session.get("accounts", [])
+        user = session.get("activeUser", "")
+        acc = next((a for a in pool if a["user"] == user), None)
+        if not acc:
+            return ""
+        token = acc.get("token", "")
         if token and self.jwt_exp(token) > time.time() + 60:
             return token
-        # token 缺失/过期，尝试用当前账户保存的密码重登
-        acc = self._active()
-        if acc and acc.get("password"):
-            self.login(acc["user"], obf_decode(acc["password"]))
-            with self.lock:
-                return self.token
+        # token 缺失/过期，尝试用该账户保存的密码重登
+        pwd_obf = acc.get("password", "")
+        if pwd_obf:
+            rsp = self.login(user, obf_decode(pwd_obf))
+            if rsp.get("error") == 0 and rsp.get("token"):
+                new_tok = rsp["token"]
+                self.session_mgr.add_or_update_account(session["sid"], user, new_tok, obf_decode(pwd_obf))
+                return new_tok
         return token
 
-    def request(self, method: str, path: str, body: bytes | None, content_type: str):
-        token = self.ensure_token()
+    def request_with_token(self, token: str, method: str, path: str, body: bytes | None, content_type: str):
         headers = {"Authorization": token}
         if body:
             headers["Content-Type"] = content_type or "application/json"
@@ -441,6 +485,7 @@ class Upstream:
             return 502, json.dumps({"error": -2, "detail": f"upstream: {_sanitize_error(str(e))}"}).encode(), {}
 
 
+_session_mgr: SessionManager | None = None
 _upstream: Upstream | None = None
 # 可选访问口令：--auth <密钥> 启用。浏览器把密钥放在 X-Panel-Key 头（前端登录后存 localStorage）。
 # 未配置时无鉴权——请配合 --host 127.0.0.1 或前置反代使用。
@@ -451,7 +496,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "OpenP2PPanel/1.0"
 
-    def log_message(self, fmt, *args):  # 精简日志
+    def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
 
     def _authorized(self) -> bool:
@@ -462,8 +507,38 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return self.headers.get("X-Panel-Key") == PANEL_KEY
 
+    def _get_session_id(self) -> str:
+        # 1. 检查 Cookie 头
+        cookie_header = self.headers.get("Cookie", "")
+        if cookie_header:
+            import http.cookies
+
+            c = http.cookies.SimpleCookie()
+            try:
+                c.load(cookie_header)
+                if SESSION_COOKIE_NAME in c:
+                    return c[SESSION_COOKIE_NAME].value
+            except Exception:
+                pass
+        # 2. 检查 X-Session-Id 请求头
+        sid = self.headers.get("X-Session-Id")
+        if sid:
+            return sid.strip()
+        # 3. 检查 Authorization 头（Bearer <sid>）
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            return auth[7:].strip()
+        return ""
+
     # ---------- 响应工具 ----------
-    def _send(self, code: int, body: bytes, ctype: str, cache_control: str | None = None):
+    def _send(
+        self,
+        code: int,
+        body: bytes,
+        ctype: str,
+        cache_control: str | None = None,
+        extra_headers: list[tuple[str, str]] | None = None,
+    ):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -477,11 +552,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", _CSP_POLICY)
         if self.headers.get("X-Forwarded-Proto") == "https" or getattr(self.server, "is_ssl", False):
             self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        if extra_headers:
+            for k, v in extra_headers:
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, obj, code: int = 200):
-        self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+    def _json(self, obj, code: int = 200, extra_headers: list[tuple[str, str]] | None = None):
+        self._send(
+            code,
+            json.dumps(obj, ensure_ascii=False).encode(),
+            "application/json; charset=utf-8",
+            extra_headers=extra_headers,
+        )
 
     # ---------- 路由 ----------
     def do_GET(self):
@@ -556,35 +639,70 @@ class Handler(BaseHTTPRequestHandler):
         return self.client_address[0] if self.client_address else "?"
 
     def _panel_api(self, method: str):
-        global _upstream
+        global _upstream, _session_mgr
+        from urllib.parse import urlparse
+
+        req_path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_BODY:
             self._send(413, b"payload too large", "text/plain")
             return
         raw = self.rfile.read(length) if length else b""
-        if self.path == "/api/state":
-            self._json({
-                "upstream": _upstream.cfg["upstream"],
-                "user": _upstream.user,
-                "hasToken": bool(_upstream.token),
-                "tokenExp": Upstream.jwt_exp(_upstream.token) if _upstream.token else 0,
-                "accounts": _upstream.list_accounts(),
-            })
-        elif self.path == "/api/accounts/switch" and method == "POST":
+
+        sid = self._get_session_id()
+        session = _session_mgr.get_session(sid)
+
+        if req_path == "/api/state":
+            if session and session.get("activeUser"):
+                pool = session.get("accounts", [])
+                user = session.get("activeUser", "")
+                acc = next((a for a in pool if a["user"] == user), None)
+                token = acc.get("token", "") if acc else ""
+                self._json({
+                    "upstream": _upstream.cfg["upstream"],
+                    "user": user,
+                    "hasToken": bool(token),
+                    "tokenExp": Upstream.jwt_exp(token) if token else 0,
+                    "accounts": [
+                        {
+                            "user": a["user"],
+                            "hasToken": bool(a.get("token")),
+                            "tokenExp": Upstream.jwt_exp(a.get("token", "")),
+                            "hasPassword": bool(a.get("password")),
+                            "active": a["user"] == user,
+                        }
+                        for a in pool
+                    ],
+                })
+            else:
+                self._json({
+                    "upstream": _upstream.cfg["upstream"],
+                    "user": "",
+                    "hasToken": False,
+                    "tokenExp": 0,
+                    "accounts": [],
+                })
+        elif req_path == "/api/accounts/switch" and method == "POST":
+            if not session:
+                self._json({"error": 401, "detail": "会话已失效，请重新登录"}, 401)
+                return
             try:
                 data = json.loads(raw.decode() or "{}")
             except json.JSONDecodeError:
                 self._json({"error": -1, "detail": "请求体不是合法 JSON"})
                 return
-            self._json(_upstream.switch_account((data.get("user") or "").strip()))
-        elif self.path == "/api/accounts/remove" and method == "POST":
+            self._json(_session_mgr.switch_account(sid, (data.get("user") or "").strip()))
+        elif req_path == "/api/accounts/remove" and method == "POST":
+            if not session:
+                self._json({"error": 401, "detail": "会话已失效，请重新登录"}, 401)
+                return
             try:
                 data = json.loads(raw.decode() or "{}")
             except json.JSONDecodeError:
                 self._json({"error": -1, "detail": "请求体不是合法 JSON"})
                 return
-            self._json(_upstream.remove_account((data.get("user") or "").strip()))
-        elif self.path == "/api/captcha" and method == "POST":
+            self._json(_session_mgr.remove_account(sid, (data.get("user") or "").strip()))
+        elif req_path == "/api/captcha" and method == "POST":
             ip = self._client_ip()
             if not _check_rate_limit(ip, 20):
                 self._json({"error": 429, "detail": "请求过于频繁"})
@@ -595,13 +713,12 @@ class Handler(BaseHTTPRequestHandler):
                 "captchaId": cid,
                 "svg": "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode(),
             })
-        elif self.path == "/api/upstream" and method == "POST":
+        elif req_path == "/api/upstream" and method == "POST":
             try:
                 data = json.loads(raw.decode() or "{}")
             except json.JSONDecodeError:
                 self._json({"error": -1, "detail": "请求体不是合法 JSON"})
                 return
-            from urllib.parse import urlparse
 
             new_up = (data.get("upstream") or "").strip().rstrip("/")
             if not new_up.startswith("http://") and not new_up.startswith("https://"):
@@ -615,7 +732,7 @@ class Handler(BaseHTTPRequestHandler):
             save_config(_upstream.cfg)
             print(f"[panel] 官方代理上游地址已更新为: {new_up}")
             self._json({"error": 0, "upstream": new_up})
-        elif self.path == "/api/login" and method == "POST":
+        elif req_path == "/api/login" and method == "POST":
             try:
                 data = json.loads(raw.decode() or "{}")
             except json.JSONDecodeError:
@@ -644,17 +761,25 @@ class Handler(BaseHTTPRequestHandler):
                     _upstream.cfg["upstream"] = new_up
                     save_config(_upstream.cfg)
             rsp = _upstream.login(user, password)
-            if rsp.get("error") == 0:
+            if rsp.get("error") == 0 and rsp.get("token"):
                 clear_fails(ip)
-                if data.get("remember"):
-                    _upstream._store(user, _upstream.token, password)
+                tok = rsp["token"]
+                if session:
+                    _session_mgr.add_or_update_account(sid, user, tok, password if data.get("remember") else None)
+                else:
+                    sid = _session_mgr.create_session(user, tok, password if data.get("remember") else None)
+                cookie = f"{SESSION_COOKIE_NAME}={sid}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax"
+                self._json(
+                    {"error": 0, "sessionId": sid, "user": user, "token": tok},
+                    extra_headers=[("Set-Cookie", cookie)],
+                )
             else:
                 record_fail(ip)
                 left = LOCK_THRESHOLD - _failures.get(ip, [0, 0])[0]
                 rsp["detail"] = _sanitize_error(rsp.get("detail") or "用户名或密码错误")[:120] + \
                     (f"（剩余 {max(left,0)} 次尝试）" if 0 < left <= LOCK_THRESHOLD else "")
-            self._json({"error": rsp.get("error"), "detail": rsp.get("detail", "")})
-        elif self.path == "/api/login-token" and method == "POST":
+                self._json({"error": rsp.get("error"), "detail": rsp.get("detail", "")})
+        elif req_path == "/api/login-token" and method == "POST":
             try:
                 data = json.loads(raw.decode() or "{}")
             except json.JSONDecodeError:
@@ -678,22 +803,29 @@ class Handler(BaseHTTPRequestHandler):
                     _upstream.cfg["upstream"] = new_up
                     save_config(_upstream.cfg)
             rsp = _upstream.login_with_token(data.get("token") or "")
-            if rsp.get("error") == 0:
+            if rsp.get("error") == 0 and rsp.get("token"):
                 clear_fails(ip)
+                tok = rsp["token"]
+                user = rsp.get("user") or Upstream.jwt_user(tok)
+                if session:
+                    _session_mgr.add_or_update_account(sid, user, tok)
+                else:
+                    sid = _session_mgr.create_session(user, tok)
+                cookie = f"{SESSION_COOKIE_NAME}={sid}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax"
+                self._json(
+                    {"error": 0, "sessionId": sid, "user": user, "token": tok},
+                    extra_headers=[("Set-Cookie", cookie)],
+                )
             else:
                 record_fail(ip)
                 if "detail" in rsp:
                     rsp["detail"] = _sanitize_error(rsp["detail"])
-            self._json(rsp)
-        elif self.path == "/api/logout" and method == "POST":
-            # 仅清除当前激活账户的 token（保留其他账户）
-            acc = _upstream._active()
-            if acc:
-                acc["token"] = ""
-            _upstream.token = ""
-            _upstream.cfg["token"] = ""
-            save_config(_upstream.cfg)
-            self._json({"ok": True})
+                self._json(rsp)
+        elif req_path == "/api/logout" and method == "POST":
+            if sid:
+                _session_mgr.delete_session(sid)
+            cookie = f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+            self._json({"ok": True}, extra_headers=[("Set-Cookie", cookie)])
         else:
             self._json({"error": -1, "detail": "unknown panel api"}, 404)
 
@@ -711,7 +843,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(413, b"payload too large", "text/plain")
             return
         raw = self.rfile.read(length) if length else None
-        code, body, headers = _upstream.request(method, path, raw, self.headers.get("Content-Type"))
+
+        sid = self._get_session_id()
+        session = _session_mgr.get_session(sid)
+        if not session:
+            self._json({"error": 401, "detail": "会话已失效，请重新登录"}, 401)
+            return
+
+        token = _upstream.ensure_token(session)
+        if not token:
+            self._json({"error": 401, "detail": "未获取到有效凭据，请重新登录"}, 401)
+            return
+
+        code, body, headers = _upstream.request_with_token(token, method, path, raw, self.headers.get("Content-Type"))
         ctype = headers.get("Content-Type", "application/json")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -722,7 +866,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global _upstream
+    global _upstream, _session_mgr
     parser = argparse.ArgumentParser(description="OpenP2P 管理面板服务器")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址，默认仅本机；对外提供请加 --auth")
     parser.add_argument("--port", type=int, default=8377)
@@ -741,41 +885,10 @@ def main():
     cfg.setdefault("upstream", DEFAULT_UPSTREAM)
     if args.upstream:
         cfg["upstream"] = args.upstream
-    if args.token:
-        cfg["token"] = args.token
-    if args.user:
-        cfg["user"] = args.user
-    # --password 归入（或预创建的）激活账户槽位
-    if args.password and not args.no_save_password and cfg.get("user"):
-        for a in cfg.setdefault("accounts", []):
-            if a["user"] == cfg["user"]:
-                a["password"] = args.password
-                break
-        else:
-            cfg["accounts"].append({"user": cfg["user"], "token": "", "password": args.password})
     save_config(cfg)
 
-    _upstream = Upstream(cfg)
-    # 启动时校验激活账户 token，无效且该账户存有密码则自动重登
-    token_ok = False
-    if _upstream.token:
-        code, body, _ = _upstream.request("POST", "/api/v1/user/profile", b"{}", "application/json")
-        if code == 200:
-            try:
-                if json.loads(body.decode()).get("error") == 0:
-                    token_ok = True
-                    print(f"[panel] token 有效，用户: {_upstream.user or Upstream.jwt_user(_upstream.token)}")
-            except Exception:
-                pass
-        if not token_ok:
-            print("[panel] token 已失效")
-    acc = _upstream._active() or {}
-    if not token_ok and acc.get("password"):
-        rsp = _upstream.login(acc["user"], obf_decode(acc["password"]))
-        if rsp.get("error") == 0:
-            print(f"[panel] 已自动登录: {acc['user']}", flush=True)
-        else:
-            print(f"[panel] 自动登录失败: {rsp}")
+    _session_mgr = SessionManager(cfg)
+    _upstream = Upstream(cfg, _session_mgr)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     warn = ""

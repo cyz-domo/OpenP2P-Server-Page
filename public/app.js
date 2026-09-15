@@ -33,23 +33,39 @@ function toast(msg, type = "") {
   toast._t = setTimeout(() => el.classList.add("hidden"), type === "err" ? 6000 : 3000);
 }
 
+function panelHeaders(extra = {}) {
+  const h = { ...extra };
+  const key = localStorage.getItem("panelKey");
+  if (key) h["X-Panel-Key"] = key;
+  const sid = localStorage.getItem("panelSession");
+  if (sid) h["X-Session-Id"] = sid;
+  return h;
+}
+
 async function pxp(path, opts = {}) {
   const headers = opts.body ? { "Content-Type": "application/json" } : {};
   const key = localStorage.getItem("panelKey");
   if (key) headers["X-Panel-Key"] = key;
+  const sid = localStorage.getItem("panelSession");
+  if (sid) headers["X-Session-Id"] = sid;
   const rsp = await fetch(API + path, {
     method: opts.method || "GET",
     headers,
+    credentials: "same-origin",
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const text = await rsp.text();
   let data;
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
   if (rsp.status === 401) {
-    // 访问口令缺失/错误：提示并让用户重新输入
-    const key2 = prompt("本面板已启用访问口令，请输入：");
-    if (key2) {
-      localStorage.setItem("panelKey", key2);
+    if (data && data.detail && data.detail.includes("口令")) {
+      const key2 = prompt("本面板已启用访问口令，请输入：");
+      if (key2) {
+        localStorage.setItem("panelKey", key2);
+        location.reload();
+      }
+    } else {
+      localStorage.removeItem("panelSession");
       location.reload();
     }
   }
@@ -101,13 +117,407 @@ function confirmDlg(title, msg) {
   });
 }
 
+/* ================= SearchSelect 可搜索下拉组件 ================= */
+class SearchSelect {
+  constructor(selectEl, options = {}) {
+    this.selectEl = typeof selectEl === "string" ? document.getElementById(selectEl) : selectEl;
+    if (!this.selectEl) return;
+    this.options = options;
+    this.items = []; // [{ value, label, subtext, online, disabled }]
+    this.filteredItems = [];
+    this.value = this.selectEl.value || "";
+    this.disabled = !!this.selectEl.disabled;
+    this.isOpen = false;
+    this.highlightIndex = -1;
+    this.placeholder = options.placeholder || "请选择…";
+    this.searchPlaceholder = options.searchPlaceholder || "输入关键字检索…";
+
+    this._initDom();
+    this._bindEvents();
+    this.selectEl._searchSelect = this;
+  }
+
+  _initDom() {
+    this.selectEl.classList.add("search-select-native-hidden");
+    this.container = document.createElement("div");
+    this.container.className = "search-select";
+    if (this.options.className) this.container.classList.add(this.options.className);
+
+    // 触发按钮
+    this.trigger = document.createElement("button");
+    this.trigger.type = "button";
+    this.trigger.className = "search-select-trigger";
+    this.trigger.setAttribute("aria-haspopup", "listbox");
+    this.trigger.setAttribute("aria-expanded", "false");
+    if (this.disabled) this.trigger.disabled = true;
+
+    this.triggerContent = document.createElement("span");
+    this.triggerContent.className = "search-select-trigger-content";
+    this.triggerContent.textContent = this.placeholder;
+
+    const arrow = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    arrow.setAttribute("viewBox", "0 0 24 24");
+    arrow.setAttribute("width", "14");
+    arrow.setAttribute("height", "14");
+    arrow.setAttribute("fill", "none");
+    arrow.setAttribute("stroke", "currentColor");
+    arrow.setAttribute("stroke-width", "2");
+    arrow.classList.add("search-select-arrow");
+    const polyline = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    polyline.setAttribute("points", "6 9 12 15 18 9");
+    arrow.appendChild(polyline);
+
+    this.trigger.appendChild(this.triggerContent);
+    this.trigger.appendChild(arrow);
+    this.container.appendChild(this.trigger);
+
+    // 下拉浮层
+    this.dropdown = document.createElement("div");
+    this.dropdown.className = "search-select-dropdown";
+
+    // 搜索栏
+    this.searchBox = document.createElement("div");
+    this.searchBox.className = "search-select-search";
+
+    const sIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    sIcon.setAttribute("viewBox", "0 0 24 24");
+    sIcon.setAttribute("width", "13");
+    sIcon.setAttribute("height", "13");
+    sIcon.setAttribute("fill", "none");
+    sIcon.setAttribute("stroke", "currentColor");
+    sIcon.setAttribute("stroke-width", "2");
+    const sCircle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    sCircle.setAttribute("cx", "11");
+    sCircle.setAttribute("cy", "11");
+    sCircle.setAttribute("r", "8");
+    const sLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    sLine.setAttribute("x1", "21");
+    sLine.setAttribute("y1", "21");
+    sLine.setAttribute("x2", "16.65");
+    sLine.setAttribute("y2", "16.65");
+    sIcon.appendChild(sCircle);
+    sIcon.appendChild(sLine);
+
+    this.searchInput = document.createElement("input");
+    this.searchInput.type = "text";
+    this.searchInput.className = "search-select-input";
+    this.searchInput.placeholder = this.searchPlaceholder;
+    this.searchInput.autocomplete = "off";
+
+    this.clearBtn = document.createElement("button");
+    this.clearBtn.type = "button";
+    this.clearBtn.className = "search-select-clear-btn";
+    this.clearBtn.title = "清空检索";
+    this.clearBtn.style.display = "none";
+    this.clearBtn.innerHTML = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+
+    this.searchBox.appendChild(sIcon);
+    this.searchBox.appendChild(this.searchInput);
+    this.searchBox.appendChild(this.clearBtn);
+    this.dropdown.appendChild(this.searchBox);
+
+    // 选项列表
+    this.optionsList = document.createElement("div");
+    this.optionsList.className = "search-select-options";
+    this.optionsList.setAttribute("role", "listbox");
+    this.dropdown.appendChild(this.optionsList);
+
+    this.container.appendChild(this.dropdown);
+    this.selectEl.parentNode.insertBefore(this.container, this.selectEl.nextSibling);
+  }
+
+  _bindEvents() {
+    this.trigger.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (this.disabled) return;
+      this.toggle();
+    });
+
+    this.searchInput.addEventListener("input", () => {
+      const q = this.searchInput.value.trim().toLowerCase();
+      this.clearBtn.style.display = q ? "flex" : "none";
+      this.filter(q);
+    });
+
+    this.clearBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.searchInput.value = "";
+      this.clearBtn.style.display = "none";
+      this.filter("");
+      this.searchInput.focus();
+    });
+
+    this.searchInput.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        this._moveHighlight(1);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        this._moveHighlight(-1);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (this.highlightIndex >= 0 && this.highlightIndex < this.filteredItems.length) {
+          const it = this.filteredItems[this.highlightIndex];
+          if (!it.disabled) this.selectItem(it.value);
+        }
+      } else if (e.key === "Escape") {
+        this.close();
+      }
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!this.container.contains(e.target)) {
+        this.close();
+      }
+    });
+  }
+
+  toggle() {
+    if (this.isOpen) this.close();
+    else this.open();
+  }
+
+  open() {
+    document.querySelectorAll(".search-select.open").forEach((el) => {
+      if (el !== this.container) el.classList.remove("open");
+    });
+    this.isOpen = true;
+    this.container.classList.add("open");
+    this.trigger.setAttribute("aria-expanded", "true");
+    this.searchInput.value = "";
+    this.clearBtn.style.display = "none";
+    this.filter("");
+    setTimeout(() => this.searchInput.focus(), 50);
+  }
+
+  close() {
+    this.isOpen = false;
+    this.container.classList.remove("open");
+    this.trigger.setAttribute("aria-expanded", "false");
+    this.highlightIndex = -1;
+  }
+
+  setDisabled(disabled) {
+    this.disabled = !!disabled;
+    this.trigger.disabled = this.disabled;
+    this.selectEl.disabled = this.disabled;
+    if (this.disabled && this.isOpen) this.close();
+  }
+
+  setOptions(items) {
+    this.items = items.map((it) => {
+      if (typeof it === "string") {
+        return { value: it, label: it, subtext: "", online: undefined, disabled: false };
+      }
+      return {
+        value: it.value !== undefined ? String(it.value) : "",
+        label: it.label || it.value || "",
+        subtext: it.subtext || "",
+        online: it.online,
+        disabled: !!it.disabled
+      };
+    });
+
+    // 同步到原生 <select>
+    this.selectEl.innerHTML = this.items.map((it) =>
+      `<option value="${esc(it.value)}"${it.disabled ? ' disabled' : ''}>${esc(it.label)}</option>`
+    ).join("");
+
+    this.filter("");
+    this._updateTrigger();
+  }
+
+  filter(keyword) {
+    const q = (keyword || "").trim().toLowerCase();
+    if (!q) {
+      this.filteredItems = [...this.items];
+    } else {
+      this.filteredItems = this.items.filter((it) =>
+        (it.label && it.label.toLowerCase().includes(q)) ||
+        (it.value && it.value.toLowerCase().includes(q)) ||
+        (it.subtext && it.subtext.toLowerCase().includes(q))
+      );
+    }
+    this.highlightIndex = -1;
+    this._renderOptions();
+  }
+
+  _renderOptions() {
+    this.optionsList.innerHTML = "";
+    if (!this.filteredItems.length) {
+      const empty = document.createElement("div");
+      empty.className = "search-select-empty";
+      empty.textContent = this.options.emptyText || "未找到匹配设备";
+      this.optionsList.appendChild(empty);
+      return;
+    }
+
+    this.filteredItems.forEach((it, idx) => {
+      const opt = document.createElement("div");
+      opt.className = "search-select-opt";
+      if (String(it.value) === String(this.value)) opt.classList.add("selected");
+      if (it.disabled) opt.classList.add("disabled");
+      if (idx === this.highlightIndex) opt.classList.add("focused");
+
+      const left = document.createElement("div");
+      left.className = "search-select-opt-left";
+
+      if (it.online !== undefined) {
+        const dot = document.createElement("span");
+        dot.className = `dot ${it.online ? "on" : "off"}`;
+        dot.style.marginRight = "6px";
+        left.appendChild(dot);
+      }
+
+      const labelSpan = document.createElement("span");
+      labelSpan.className = "search-select-opt-label";
+      labelSpan.textContent = it.label;
+      left.appendChild(labelSpan);
+
+      opt.appendChild(left);
+
+      if (it.subtext) {
+        const sub = document.createElement("span");
+        sub.className = "search-select-opt-sub";
+        sub.textContent = it.subtext;
+        opt.appendChild(sub);
+      }
+
+      opt.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (it.disabled) return;
+        this.selectItem(it.value);
+      });
+
+      this.optionsList.appendChild(opt);
+    });
+  }
+
+  _moveHighlight(delta) {
+    if (!this.filteredItems.length) return;
+    this.highlightIndex = Math.max(0, Math.min(this.filteredItems.length - 1, this.highlightIndex + delta));
+    this._renderOptions();
+    const focusedEl = this.optionsList.children[this.highlightIndex];
+    if (focusedEl) focusedEl.scrollIntoView({ block: "nearest" });
+  }
+
+  selectItem(val, triggerChange = true) {
+    this.value = String(val);
+    this.selectEl.value = this.value;
+    this._updateTrigger();
+    this.close();
+    if (triggerChange) {
+      this.selectEl.dispatchEvent(new Event("change", { bubbles: true }));
+      if (typeof this.options.onChange === "function") {
+        const cur = this.items.find((x) => String(x.value) === String(this.value));
+        this.options.onChange(this.value, cur);
+      }
+    }
+  }
+
+  setValue(val, triggerChange = false) {
+    this.value = val !== undefined && val !== null ? String(val) : "";
+    this.selectEl.value = this.value;
+    this._updateTrigger();
+    if (triggerChange) {
+      this.selectEl.dispatchEvent(new Event("change", { bubbles: true }));
+      if (typeof this.options.onChange === "function") {
+        const cur = this.items.find((x) => String(x.value) === String(this.value));
+        this.options.onChange(this.value, cur);
+      }
+    }
+  }
+
+  getValue() {
+    return this.value;
+  }
+
+  _updateTrigger() {
+    const cur = this.items.find((it) => String(it.value) === String(this.value));
+    this.triggerContent.innerHTML = "";
+    if (cur) {
+      if (cur.online !== undefined) {
+        const dot = document.createElement("span");
+        dot.className = `dot ${cur.online ? "on" : "off"}`;
+        dot.style.marginRight = "6px";
+        this.triggerContent.appendChild(dot);
+      }
+      const textNode = document.createElement("span");
+      textNode.className = "search-select-trigger-text";
+      textNode.textContent = cur.label;
+      this.triggerContent.appendChild(textNode);
+    } else {
+      const ph = document.createElement("span");
+      ph.className = "muted";
+      ph.textContent = this.placeholder;
+      this.triggerContent.appendChild(ph);
+    }
+  }
+}
+
+/** 限制最大并发数的 Promise 批处理执行器，防止突发流量冲击源站连接池 */
+async function runBatchLimit(taskFns, limit = 4) {
+  const results = new Array(taskFns.length);
+  const executing = [];
+  for (let i = 0; i < taskFns.length; i++) {
+    const fn = taskFns[i];
+    const p = Promise.resolve().then(() => fn())
+      .then((val) => { results[i] = { status: "fulfilled", value: val }; })
+      .catch((err) => { results[i] = { status: "rejected", reason: err }; });
+    executing.push(p);
+    const clean = () => {
+      const idx = executing.indexOf(p);
+      if (idx !== -1) executing.splice(idx, 1);
+    };
+    p.then(clean, clean);
+    if (executing.length >= limit) {
+      await Promise.race(executing);
+    }
+  }
+  await Promise.all(executing);
+  return results;
+}
+
+let tlNodeFilterSS, ruNodeSS, ruPeerSS, netCentralSS, memSelSS;
+
+function initSearchSelects() {
+  if ($("tlNodeFilter") && !tlNodeFilterSS) {
+    tlNodeFilterSS = new SearchSelect($("tlNodeFilter"), {
+      placeholder: "全部设备",
+      searchPlaceholder: "检索设备以筛选…",
+      onChange: () => renderTunnels()
+    });
+  }
+  if ($("ruNode") && !ruNodeSS) {
+    ruNodeSS = new SearchSelect($("ruNode"), {
+      placeholder: "请选择所在设备…",
+      searchPlaceholder: "检索设备名 / IP / 系统…"
+    });
+  }
+  if ($("ruPeer") && !ruPeerSS) {
+    ruPeerSS = new SearchSelect($("ruPeer"), {
+      placeholder: "请选择对端设备…",
+      searchPlaceholder: "检索设备名 / IP / 系统…"
+    });
+  }
+  if ($("netCentral") && !netCentralSS) {
+    netCentralSS = new SearchSelect($("netCentral"), {
+      placeholder: "不指定 (自动选路)",
+      searchPlaceholder: "检索中心节点…"
+    });
+  }
+  if ($("memSel") && !memSelSS) {
+    memSelSS = new SearchSelect($("memSel"), {
+      placeholder: "选择网络成员…",
+      searchPlaceholder: "检索成员节点…"
+    });
+  }
+}
+
 /* ---------------- 登录 / 会话 ---------------- */
 async function checkState() {
   try {
-    const headers = {};
-    const key = localStorage.getItem("panelKey");
-    if (key) headers["X-Panel-Key"] = key;
-    const rsp = await fetch("/api/state", { headers });
+    const rsp = await fetch("/api/state", { headers: panelHeaders(), credentials: "same-origin" });
     if (rsp.status === 401) {
       const key2 = prompt("本面板已启用访问口令，请输入：");
       if (key2) {
@@ -141,16 +551,14 @@ document.querySelectorAll("[data-upstream]").forEach((btn) => {
 
 async function reloadCaptcha() {
   try {
-    const headers = { "Content-Type": "application/json", "X-Panel-Theme": document.documentElement.dataset.theme || "dark" };
-    const key = localStorage.getItem("panelKey");
-    if (key) headers["X-Panel-Key"] = key;
-    const rsp = await fetch("/api/captcha", { method: "POST", headers });
+    const headers = panelHeaders({ "Content-Type": "application/json", "X-Panel-Theme": document.documentElement.dataset.theme || "dark" });
+    const rsp = await fetch(`/api/captcha?_t=${Date.now()}`, { method: "POST", headers, credentials: "same-origin", cache: "no-store" });
     const data = await rsp.json();
     captchaId = data.captchaId || "";
-    $("captchaImg").src = data.svg || "";
-    $("loginCaptcha").value = "";
+    if ($("captchaImg")) $("captchaImg").src = data.svg || "";
+    if ($("loginCaptcha")) $("loginCaptcha").value = "";
   } catch (e) {
-    $("captchaImg").alt = "验证码加载失败";
+    if ($("captchaImg")) $("captchaImg").alt = "验证码加载失败";
   }
 }
 
@@ -165,7 +573,8 @@ document.querySelectorAll(".seg-btn").forEach((btn) =>
   })
 );
 
-$("captchaImg").addEventListener("click", reloadCaptcha);
+if ($("captchaWrap")) $("captchaWrap").addEventListener("click", reloadCaptcha);
+if ($("captchaImg")) $("captchaImg").addEventListener("click", reloadCaptcha);
 
 $("loginForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -176,9 +585,7 @@ $("loginForm").addEventListener("submit", async (ev) => {
     $("loginErr").classList.remove("hidden");
     return;
   }
-  const headers = { "Content-Type": "application/json" };
-  const key = localStorage.getItem("panelKey");
-  if (key) headers["X-Panel-Key"] = key;
+  const headers = panelHeaders({ "Content-Type": "application/json" });
   const url = loginMode === "password" ? "/api/login" : "/api/login-token";
   const upstream = $("loginUpstream") ? $("loginUpstream").value.trim() : "";
   const body = loginMode === "password"
@@ -201,13 +608,14 @@ $("loginForm").addEventListener("submit", async (ev) => {
     $("loginErr").classList.remove("hidden");
     return;
   }
-  const rsp = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const rsp = await fetch(url, { method: "POST", headers, credentials: "same-origin", body: JSON.stringify(body) });
   const data = await rsp.json();
   if (data.error === 0) {
-    state.user = loginMode === "password" ? $("loginUser").value.trim() : (data.user || "");
+    if (data.sessionId) localStorage.setItem("panelSession", data.sessionId);
+    state.user = data.user || (loginMode === "password" ? $("loginUser").value.trim() : "");
     // 登录成功后刷新账户列表（新账户已入池）
     try {
-      const st = await (await fetch("/api/state", { headers: panelHeaders() })).json();
+      const st = await (await fetch("/api/state", { headers: panelHeaders(), credentials: "same-origin" })).json();
       state.accounts = st.accounts || [];
     } catch {}
     enterMain();
@@ -219,16 +627,15 @@ $("loginForm").addEventListener("submit", async (ev) => {
 });
 
 $("btnLogout").addEventListener("click", async () => {
-  const headers = { method: "POST" };
-  const key = localStorage.getItem("panelKey");
-  if (key) headers.headers = { "X-Panel-Key": key };
-  await fetch("/api/logout", headers);
+  localStorage.removeItem("panelSession");
+  await fetch("/api/logout", { method: "POST", headers: panelHeaders(), credentials: "same-origin" });
   location.reload();
 });
 
 async function enterMain() {
   $("loginView").classList.add("hidden");
   $("mainView").classList.remove("hidden");
+  if ($("topBar")) $("topBar").classList.remove("hidden");
   $("connState").textContent = "已连接";
   $("connState").className = "badge on";
   $("userInfo").textContent = state.user || "";
@@ -294,7 +701,10 @@ document.addEventListener("click", async (ev) => {
   const add = ev.target.closest(".acct-add");
   if (add) {
     menu.classList.add("hidden");
+    $("topBar").classList.add("hidden");
+    $("mainView").classList.add("hidden");
     $("loginView").classList.remove("hidden");
+    $("linkCancelLogin").classList.remove("hidden");
     $("loginErr").classList.add("hidden");
     await reloadCaptcha();
     return;
@@ -318,17 +728,11 @@ document.addEventListener("click", async (ev) => {
   if (!ev.target.closest(".acct-wrap")) menu.classList.add("hidden");
 });
 
-function panelHeaders(extra = {}) {
-  const h = { ...extra };
-  const key = localStorage.getItem("panelKey");
-  if (key) h["X-Panel-Key"] = key;
-  return h;
-}
-
 async function pxp2(path, body) {
   const rsp = await fetch(path, {
     method: "POST",
     headers: panelHeaders({ "Content-Type": "application/json" }),
+    credentials: "same-origin",
     body: JSON.stringify(body),
   });
   return rsp.json();
@@ -336,8 +740,13 @@ async function pxp2(path, body) {
 
 /* ---------------- 数据加载 ---------------- */
 let _refreshing = false; // 防并发：refreshAll 重入会交错重绘 DOM 导致 null 引用
-async function refreshAll() {
+let _lastRefreshAllTs = 0;
+
+async function refreshAll(force = false) {
   if (_refreshing) return;
+  const now = Date.now();
+  if (!force && now - _lastRefreshAllTs < 1500) return;
+  _lastRefreshAllTs = now;
   _refreshing = true;
   try {
     const [devs, sdw, prof] = await Promise.all([
@@ -356,8 +765,11 @@ async function refreshAll() {
     renderDevices();
     renderNetwork();
     renderDownload();
-    await refreshTunnels(true);
-    loadMemStatus();
+
+    // 优化：按需加载。在非隧道/网络页时避免向所有在线节点突发下发推送指令
+    if (state.selView === "tunnels" || state.selView === "networks" || force) {
+      await refreshTunnels(true);
+    }
   } catch (e) {
     console.error("[refreshAll]", e);
     toast("网络错误: " + e, "err");
@@ -366,44 +778,67 @@ async function refreshAll() {
   }
 }
 
-/** 并发拉取所有在线设备的规则列表。
+/** 并发受限拉取所有在线设备的规则列表（最大并发4，防止瞬间占用过多连接池）。
  *  端口转发来自 subtype=7（本机发起的隧道应用）；
- *  组网隧道全拓扑来自 subtype=17（成员视角，含未活跃对端）——两者合并去重。 */
-async function refreshTunnels(quiet = false) {
-  const online = state.devices.filter(onlineDev);
-  if (!quiet) toast(`正在拉取 ${online.length} 台在线设备的规则…`);
-  const [r7, r17] = await Promise.allSettled([
-    Promise.allSettled(online.map((d) => pushCmd(d.name, 7, {}, 1))),
-    Promise.allSettled(online.map((d) => pushCmd(d.name, 17, {}, 1))),
-  ]);
-  const map = {};
-  for (const d of state.devices) map[d.name] = map[d.name] || [];
-  const put = (i, arr) => { map[online[i].name] = arr; };
-  const get = (res, i) => (res.status === "fulfilled" && res.value[i].status === "fulfilled"
-    && res.value[i].value.status === 200 && Array.isArray(res.value[i].value.data.Apps))
-    ? res.value[i].value.data.Apps : null;
+ *  组网隧道全拓扑来自 subtype=17（成员视角，含未活跃对端）——两者合并去重，并同步填充成员状态缓存。 */
+let _refreshingTunnels = false;
+let _lastRefreshTunnelsTs = 0;
 
-  if (r7.status === "fulfilled") {
+async function refreshTunnels(quiet = false) {
+  if (_refreshingTunnels) return;
+  const now = Date.now();
+  if (now - _lastRefreshTunnelsTs < 1500 && quiet) return;
+  _lastRefreshTunnelsTs = now;
+  _refreshingTunnels = true;
+
+  try {
+    const online = state.devices.filter(onlineDev);
+    if (!online.length) {
+      state.tunnelByNode = {};
+      renderTunnels();
+      return;
+    }
+    if (!quiet) toast(`正在拉取 ${online.length} 台在线设备的规则…`);
+
+    // 采用受限并发池（限制同时最多 4 个长轮询连接），避免瞬间打满源站连接池
+    const [r7, r17] = await Promise.all([
+      runBatchLimit(online.map((d) => () => pushCmd(d.name, 7, {}, 1)), 4),
+      runBatchLimit(online.map((d) => () => pushCmd(d.name, 17, {}, 1)), 4),
+    ]);
+
+    const map = {};
+    for (const d of state.devices) map[d.name] = map[d.name] || [];
+    const put = (i, arr) => { map[online[i].name] = arr; };
+    const get = (resArr, i) => (resArr[i] && resArr[i].status === "fulfilled"
+      && resArr[i].value.status === 200 && Array.isArray(resArr[i].value.data.Apps))
+      ? resArr[i].value.data.Apps : null;
+
     for (let i = 0; i < online.length; i++) {
       const apps = get(r7, i);
       if (apps) put(i, apps.filter((a) => a.srcPort)); // subtype=7 只保留端口转发
     }
-  }
-  if (r17.status === "fulfilled") {
+
     for (let i = 0; i < online.length; i++) {
       const mem = get(r17, i);
       if (!mem) continue;
-      // 组网隧道：subtype=17 全量；去掉与 7 中同对端appName的重复（7 里的组网条目是子集）
+      // 同步直接填充 state.memByNode 缓存，避免重复发起 loadMemStatus
+      state.memByNode[online[i].name] = mem;
       const existing = new Set(map[online[i].name].map((a) => a.peerNode + "|" + (a.appName || "")));
       for (const a of mem) {
         const k = a.peerNode + "|" + (a.appName || "");
         if (!existing.has(k)) map[online[i].name].push(a);
       }
     }
+
+    state.tunnelByNode = map;
+    renderTunnels();
+    if (state.selView === "networks") renderNetwork();
+    if (!quiet) toast("规则已刷新", "ok");
+  } catch (err) {
+    console.error("[refreshTunnels]", err);
+  } finally {
+    _refreshingTunnels = false;
   }
-  state.tunnelByNode = map;
-  renderTunnels();
-  if (!quiet) toast("规则已刷新");
 }
 
 function renderOsTag(osStr, devName) {
@@ -651,7 +1086,9 @@ $("devTable").addEventListener("click", (ev) => {
   const act = btn.dataset.act;
   if (act === "tunnels") {
     switchView("tunnels");
-    $("tlNodeFilter").value = node;
+    initSearchSelects();
+    if (tlNodeFilterSS) tlNodeFilterSS.setValue(node);
+    else $("tlNodeFilter").value = node;
     state.ruleCtxNode = node; // 记住上下文：新建规则时默认落在该设备
     renderTunnels();
   } else if (act === "editdev") openDevDialog(node);
@@ -672,18 +1109,23 @@ function ruleType(rule) {
 }
 
 function renderTunnels() {
-  const nodeFilter = $("tlNodeFilter").value || "";
+  initSearchSelects();
+  const curFilter = tlNodeFilterSS ? tlNodeFilterSS.getValue() : ($("tlNodeFilter").value || "");
+  const filterOptions = [
+    { value: "", label: "全部设备", subtext: `共 ${state.devices.length} 台` },
+    ...state.devices.map((d) => ({
+      value: d.name,
+      label: d.name,
+      online: onlineDev(d),
+      subtext: `${d.ip || "-"}${d.os ? " · " + d.os : ""}`
+    }))
+  ];
+  if (tlNodeFilterSS) {
+    tlNodeFilterSS.setOptions(filterOptions);
+    tlNodeFilterSS.setValue(curFilter);
+  }
+  const nodeFilter = tlNodeFilterSS ? tlNodeFilterSS.getValue() : ($("tlNodeFilter").value || "");
   const kw = $("tlSearch").value.trim().toLowerCase();
-
-  const sel = $("tlNodeFilter");
-  const cur = sel.value;
-  const dotOf = (name) => {
-    const d = state.devices.find((x) => x.name === name);
-    return d && onlineDev(d) ? "🟢" : "⚪";
-  };
-  sel.innerHTML = `<option value="">全部设备</option>` +
-    state.devices.map((d) => `<option value="${esc(d.name)}">${dotOf(d.name)} ${esc(d.name)}</option>`).join("");
-  sel.value = cur;
 
 
   const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
@@ -875,10 +1317,25 @@ $("btnRefreshAll").addEventListener("click", () => refreshAll());
 
 /* ---------------- 新建/编辑转发规则 ---------------- */
 function fillNodeSelects() {
-  const opts = state.devices.map((d) =>
-    `<option value="${esc(d.name)}">${esc(d.name)}${onlineDev(d) ? "" : "（离线）"}</option>`).join("");
-  $("ruNode").innerHTML = opts;
-  $("ruPeer").innerHTML = opts;
+  initSearchSelects();
+  const items = state.devices.map((d) => ({
+    value: d.name,
+    label: d.name,
+    online: onlineDev(d),
+    subtext: `${d.ip || "-"}${d.os ? " · " + d.os : ""}${onlineDev(d) ? "" : "（离线）"}`
+  }));
+  if (ruNodeSS) ruNodeSS.setOptions(items);
+  else {
+    const opts = state.devices.map((d) =>
+      `<option value="${esc(d.name)}">${esc(d.name)}${onlineDev(d) ? "" : "（离线）"}</option>`).join("");
+    $("ruNode").innerHTML = opts;
+  }
+  if (ruPeerSS) ruPeerSS.setOptions(items);
+  else {
+    const opts = state.devices.map((d) =>
+      `<option value="${esc(d.name)}">${esc(d.name)}${onlineDev(d) ? "" : "（离线）"}</option>`).join("");
+    $("ruPeer").innerHTML = opts;
+  }
 }
 
 function openRuleDialog(node, existing) {
@@ -886,13 +1343,19 @@ function openRuleDialog(node, existing) {
   $("ruleErr").classList.add("hidden");
   const editing = !!existing;
   $("ruleDlgTitle").textContent = editing ? `编辑规则（${node}）` : "新建转发规则";
-  $("ruNode").value = node;
-  $("ruNode").disabled = editing;
+  if (ruNodeSS) {
+    ruNodeSS.setValue(node);
+    ruNodeSS.setDisabled(editing);
+  } else {
+    $("ruNode").value = node;
+    $("ruNode").disabled = editing;
+  }
   if (editing) {
     $("ruAppName").value = existing.appName;
     $("ruSrcPort").value = existing.srcPort;
     $("ruProto").value = existing.protocol || "tcp";
-    $("ruPeer").value = existing.peerNode || "";
+    if (ruPeerSS) ruPeerSS.setValue(existing.peerNode || "");
+    else $("ruPeer").value = existing.peerNode || "";
     $("ruDstHost").value = existing.dstHost || "localhost";
     $("ruDstPort").value = existing.dstPort || "";
     $("ruWhitelist").value = existing.whitelist || "";
@@ -902,7 +1365,9 @@ function openRuleDialog(node, existing) {
     $("ruAppName").value = "";
     $("ruSrcPort").value = "";
     $("ruProto").value = "tcp";
-    $("ruPeer").selectedIndex = 0;
+    const peerCandidate = state.devices.find((d) => d.name !== node && onlineDev(d)) || state.devices.find((d) => d.name !== node) || state.devices[0];
+    if (ruPeerSS) ruPeerSS.setValue(peerCandidate ? peerCandidate.name : "");
+    else $("ruPeer").selectedIndex = 0;
     $("ruDstHost").value = "localhost";
     $("ruDstPort").value = "";
     $("ruWhitelist").value = "";
@@ -918,7 +1383,7 @@ $("btnAddRule").addEventListener("click", () => {
   if (!online.length) { toast("无在线设备，无法下发规则", "err"); return; }
   // 默认所在设备优先级：当前筛选设备 > 跳转来源上下文 > 第一台在线设备
   const ctx = state.ruleCtxNode;
-  const filter = $("tlNodeFilter").value;
+  const filter = tlNodeFilterSS ? tlNodeFilterSS.getValue() : $("tlNodeFilter").value;
   const preferred = [filter, ctx].filter(Boolean)
     .find((n) => onlineDev(state.devices.find((d) => d.name === n) || {}));
   openRuleDialog(preferred || online[0].name, null);
@@ -928,7 +1393,7 @@ $("ruCancel").addEventListener("click", () => $("ruleDialog").close());
 
 // 对端服务探测：在对端设备上检查 dstHost:dstPort 是否可达（MsgPushCheckRemoteService=19）
 $("ruCheckSvc").addEventListener("click", async () => {
-  const peer = $("ruPeer").value;
+  const peer = ruPeerSS ? ruPeerSS.getValue() : $("ruPeer").value;
   const host = $("ruDstHost").value.trim() || "localhost";
   const port = +$("ruDstPort").value;
   const out = $("ruCheckResult");
@@ -949,12 +1414,13 @@ $("ruCheckSvc").addEventListener("click", async () => {
 
 $("ruleForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  const node = $("ruNode").value;
+  const node = ruNodeSS ? ruNodeSS.getValue() : $("ruNode").value;
+  const peer = ruPeerSS ? ruPeerSS.getValue() : $("ruPeer").value;
   const body = {
     appName: $("ruAppName").value.trim(),
     protocol: $("ruProto").value,
     srcPort: +$("ruSrcPort").value,
-    peerNode: $("ruPeer").value,
+    peerNode: peer,
     dstHost: $("ruDstHost").value.trim() || "localhost",
     dstPort: +$("ruDstPort").value,
     whitelist: $("ruWhitelist").value.trim(),
@@ -998,6 +1464,7 @@ function renderNetwork() {
   }
   $("netLoading").classList.add("hidden");
   $("netEditor").classList.remove("hidden");
+  initSearchSelects();
   const s = state.sdwan;
   $("netName").value = s.name || "";
   $("netGateway").value = s.gateway || "";
@@ -1005,9 +1472,23 @@ function renderNetwork() {
   $("netMtu").value = s.mtu || 1420;
   $("netPunch").value = String(s.punchPriority ?? 1);
 
-  $("netCentral").innerHTML = [`<option value="">不指定</option>`]
-    .concat(state.devices.map((d) => `<option value="${esc(d.name)}">${esc(d.name)}</option>`)).join("");
-  $("netCentral").value = s.centralNode || "";
+  const centralItems = [
+    { value: "", label: "不指定 (自动选路)", subtext: "" },
+    ...state.devices.map((d) => ({
+      value: d.name,
+      label: d.name,
+      online: onlineDev(d),
+      subtext: `${d.ip || "-"}${d.os ? " · " + d.os : ""}`
+    }))
+  ];
+  if (netCentralSS) {
+    netCentralSS.setOptions(centralItems);
+    netCentralSS.setValue(s.centralNode || "");
+  } else {
+    $("netCentral").innerHTML = [`<option value="">不指定</option>`]
+      .concat(state.devices.map((d) => `<option value="${esc(d.name)}">${esc(d.name)}</option>`)).join("");
+    $("netCentral").value = s.centralNode || "";
+  }
   $("netCentralWrap").style.display = $("netMode").value === "central" ? "" : "none";
 
   const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
@@ -1043,7 +1524,22 @@ function renderNetwork() {
   }).join("") || `<tr><td colspan="7" class="muted" style="text-align:center">无成员</td></tr>`;
 
   // 成员明细下拉
-  $("memSel").innerHTML = members.map((m) => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
+  const memberItems = members.map((m) => {
+    const dev = devMap[m.name];
+    return {
+      value: m.name,
+      label: m.name,
+      online: dev ? onlineDev(dev) : undefined,
+      subtext: m.ip || (dev ? dev.ip : "")
+    };
+  });
+  if (memSelSS) {
+    const curMem = memSelSS.getValue() || (members[0] ? members[0].name : "");
+    memSelSS.setOptions(memberItems);
+    memSelSS.setValue(curMem);
+  } else {
+    $("memSel").innerHTML = members.map((m) => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
+  }
 }
 
 $("netMode").addEventListener("change", () => {
@@ -1051,20 +1547,80 @@ $("netMode").addEventListener("change", () => {
 });
 
 /* 批量加入成员 */
+let mdCandidates = [];
+let mdSelected = new Set();
+
+function renderMemberCandidates(keyword = "") {
+  const q = (keyword || "").trim().toLowerCase();
+  const filtered = !q ? mdCandidates : mdCandidates.filter((d) =>
+    d.name.toLowerCase().includes(q) ||
+    (d.ip && d.ip.toLowerCase().includes(q)) ||
+    (d.os && d.os.toLowerCase().includes(q))
+  );
+
+  $("mdCount").textContent = `已选 ${mdSelected.size} 台`;
+
+  const visibleSelectedCount = filtered.filter((d) => mdSelected.has(d.name)).length;
+  $("mdChkAll").checked = filtered.length > 0 && visibleSelectedCount === filtered.length;
+  $("mdChkAll").indeterminate = visibleSelectedCount > 0 && visibleSelectedCount < filtered.length;
+
+  if (!filtered.length) {
+    $("mdList").innerHTML = `<div class="muted" style="text-align:center;padding:24px 0">未找到匹配的待添加设备</div>`;
+    return;
+  }
+
+  $("mdList").innerHTML = filtered.map((d) => {
+    const isChecked = mdSelected.has(d.name);
+    const isOnline = onlineDev(d);
+    return `<label class="md-item ${isChecked ? "selected" : ""}" data-name="${esc(d.name)}">
+      <input type="checkbox" value="${esc(d.name)}" ${isChecked ? "checked" : ""}>
+      <span class="dot ${isOnline ? "on" : "off"}"></span>
+      <span class="name">${esc(d.name)}</span>
+      <span class="muted">${esc(d.ip || "-")}${d.os ? " · " + esc(d.os) : ""} · ${isOnline ? "在线" : "离线"}</span>
+    </label>`;
+  }).join("");
+}
+
 $("btnBatchAddMember").addEventListener("click", () => {
   const members = new Set((state.sdwan.Nodes || []).map((m) => m.name));
-  const candidates = state.devices.filter((d) => !members.has(d.name));
-  if (!candidates.length) { toast("所有设备都已在网络中", "err"); return; }
-  $("mdList").innerHTML = candidates.map((d) =>
-    `<label class="md-item"><input type="checkbox" value="${esc(d.name)}">
-     <span class="name">${esc(d.name)}</span>
-     <span class="muted">${esc(d.ip || "")} ${onlineDev(d) ? "· 在线" : "· 离线"}</span></label>`).join("");
+  mdCandidates = state.devices.filter((d) => !members.has(d.name));
+  if (!mdCandidates.length) { toast("所有设备都已在网络中", "err"); return; }
+  mdSelected = new Set();
+  $("mdSearch").value = "";
+  renderMemberCandidates("");
   $("memberDialog").showModal();
 });
+
+$("mdSearch").addEventListener("input", () => renderMemberCandidates($("mdSearch").value));
+
+$("mdChkAll").addEventListener("change", () => {
+  const q = $("mdSearch").value.trim().toLowerCase();
+  const filtered = !q ? mdCandidates : mdCandidates.filter((d) =>
+    d.name.toLowerCase().includes(q) ||
+    (d.ip && d.ip.toLowerCase().includes(q)) ||
+    (d.os && d.os.toLowerCase().includes(q))
+  );
+  if ($("mdChkAll").checked) {
+    filtered.forEach((d) => mdSelected.add(d.name));
+  } else {
+    filtered.forEach((d) => mdSelected.delete(d.name));
+  }
+  renderMemberCandidates($("mdSearch").value);
+});
+
+$("mdList").addEventListener("change", (e) => {
+  const chk = e.target.closest("input[type=checkbox]");
+  if (!chk) return;
+  if (chk.checked) mdSelected.add(chk.value);
+  else mdSelected.delete(chk.value);
+  renderMemberCandidates($("mdSearch").value);
+});
+
 $("mdCancel").addEventListener("click", () => $("memberDialog").close());
+
 $("memberForm").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  const picked = [...$("mdList").querySelectorAll("input:checked")].map((c) => c.value);
+  const picked = Array.from(mdSelected);
   if (!picked.length) { $("memberDialog").close(); return; }
   const used = new Set((state.sdwan.Nodes || []).map((m) => m.ip).filter(Boolean));
   for (const name of picked) {
@@ -1080,7 +1636,9 @@ $("netTable").addEventListener("click", (ev) => {
   const link = ev.target.closest(".member-link[data-jump]");
   if (link) {
     switchView("tunnels");
-    $("tlNodeFilter").value = link.dataset.jump;
+    initSearchSelects();
+    if (tlNodeFilterSS) tlNodeFilterSS.setValue(link.dataset.jump);
+    else $("tlNodeFilter").value = link.dataset.jump;
     state.ruleCtxNode = link.dataset.jump;
     renderTunnels();
     toast(`已按设备「${link.dataset.jump}」筛选隧道`, "ok");
@@ -1101,7 +1659,7 @@ $("btnNetSave").addEventListener("click", async () => {
   s.name = $("netName").value.trim();
   s.gateway = $("netGateway").value.trim();
   s.mode = $("netMode").value;
-  s.centralNode = $("netCentral").value;
+  s.centralNode = netCentralSS ? netCentralSS.getValue() : $("netCentral").value;
   s.punchPriority = +$("netPunch").value;
   s.mtu = +$("netMtu").value || 1420;
   document.querySelectorAll("#netTable tbody tr").forEach((tr) => {
@@ -1144,7 +1702,7 @@ $("btnMemStatus").addEventListener("click", async () => {
 
 /* 成员隧道明细（MsgPushReportMemApps=17，仅在线成员可查） */
 $("btnMemRefresh").addEventListener("click", async () => {
-  const member = $("memSel").value;
+  const member = memSelSS ? memSelSS.getValue() : $("memSel").value;
   if (!member) return;
   const dev = state.devices.find((d) => d.name === member);
   if (!dev || !onlineDev(dev)) { toast(`${member} 离线，无法读取隧道状态`, "err"); return; }
@@ -1160,7 +1718,7 @@ $("btnMemRefresh").addEventListener("click", async () => {
   renderMemApps();
 });
 
-/** 并发拉取全部在线成员的组网隧道状态（subtype=17），刷新成员表连接状态列 */
+/** 并发受限拉取全部在线成员的组网隧道状态（subtype=17），刷新成员表连接状态列 */
 async function loadMemStatus() {
   const members = (state.sdwan && state.sdwan.Nodes) || [];
   const online = members.filter((m) => {
@@ -1168,10 +1726,10 @@ async function loadMemStatus() {
     return d && onlineDev(d);
   });
   if (!online.length) return;
-  const results = await Promise.allSettled(online.map((m) => pushCmd(m.name, 17, {}, 1)));
+  const results = await runBatchLimit(online.map((m) => () => pushCmd(m.name, 17, {}, 1)), 4);
   for (let i = 0; i < online.length; i++) {
     const r = results[i];
-    if (r.status === "fulfilled" && r.value.status === 200 && Array.isArray(r.value.data.Apps)) {
+    if (r && r.status === "fulfilled" && r.value && r.value.status === 200 && Array.isArray(r.value.data.Apps)) {
       state.memByNode[online[i].name] = r.value.data.Apps;
     }
   }
@@ -1179,11 +1737,12 @@ async function loadMemStatus() {
 }
 
 function renderMemApps() {
+  const curMember = memSelSS ? memSelSS.getValue() : $("memSel").value;
   const tbody = $("memTable").querySelector("tbody");
   tbody.innerHTML = state.memApps.map((a) => {
     const relay = a.specRelayNode || a.relayNode || "";
     return `<tr>
-      <td>${esc($("memSel").value)}</td>
+      <td>${esc(curMember)}</td>
       <td class="name">${esc(a.peerNode || "-")}</td>
       <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
       <td class="relay">${relay ? esc(relay) : '<span class="muted">P2P 直连</span>'}</td>
@@ -1319,13 +1878,29 @@ $("resetForm").addEventListener("submit", async (ev) => {
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("panelTheme", theme);
-  $("btnTheme").textContent = theme === "light" ? "☀️" : "🌙";
+  const icon = theme === "light" ? "☀️" : "🌙";
+  if ($("btnTheme")) $("btnTheme").textContent = icon;
+  if ($("btnLoginTheme")) $("btnLoginTheme").textContent = icon;
 }
 $("btnTheme").addEventListener("click", () => {
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
   reloadCaptcha(); // 验证码配色跟随主题
 });
+if ($("btnLoginTheme")) {
+  $("btnLoginTheme").addEventListener("click", () => {
+    applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+    reloadCaptcha();
+  });
+}
 applyTheme(localStorage.getItem("panelTheme") || "dark");
+
+if ($("linkCancelLogin")) {
+  $("linkCancelLogin").addEventListener("click", () => {
+    $("loginView").classList.add("hidden");
+    $("topBar").classList.remove("hidden");
+    $("mainView").classList.remove("hidden");
+  });
+}
 
 /* ---------------- 控制台设置与上游域名切换 ---------------- */
 $("btnSettings").addEventListener("click", () => {
@@ -1384,7 +1959,9 @@ document.querySelectorAll(".tab").forEach((t) =>
   if (await checkState()) {
     await enterMain();
   } else {
+    if ($("topBar")) $("topBar").classList.add("hidden");
     $("loginView").classList.remove("hidden");
+    if ($("linkCancelLogin")) $("linkCancelLogin").classList.add("hidden");
     $("connState").textContent = "未登录";
     if (state.user) $("loginUser").value = state.user;
     await reloadCaptcha();
