@@ -1895,3 +1895,22 @@ dialog form {
     font-size: 18px;
   }
 }
+
+/* 隐藏 EdgeOne / Pages 演示环境注入的底部横幅与徽章 */
+#edgeone-pages-badge,
+.edgeone-pages-badge,
+[id*="edgeone-badge"],
+[class*="edgeone-badge"],
+[id*="edgeone_watermark"],
+[class*="edgeone_watermark"],
+[id*="edgeone-watermark"],
+[class*="edgeone-watermark"],
+div:has(> a[href*="edgeone.ai"]),
+div:has(> a[href*="edgeone.cool"]),
+div:has(> a[href*="tencentcloud.com/edgeone"]) {
+  display: none !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
