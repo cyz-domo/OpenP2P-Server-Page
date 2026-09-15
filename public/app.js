@@ -958,10 +958,22 @@ function renderDevices() {
   if ($("statOnlineDev")) $("statOnlineDev").textContent = onlineCount;
   if ($("statOfflineDev")) $("statOfflineDev").textContent = offlineCount;
 
+  if ($("devStatusFilter")) {
+    const curVal = $("devStatusFilter").value || "all";
+    if ($("devStatusFilter").options.length >= 3) {
+      $("devStatusFilter").options[0].textContent = `全部状态 (${total})`;
+      $("devStatusFilter").options[1].textContent = `🟢 仅看在线 (${onlineCount})`;
+      $("devStatusFilter").options[2].textContent = `⚪ 仅看离线 (${offlineCount})`;
+    }
+    $("devStatusFilter").value = curVal;
+  }
+
   const kw = $("devSearch").value.trim().toLowerCase();
-  const onlyOnline = $("devOnlyOnline").checked;
+  const statusFilter = $("devStatusFilter") ? $("devStatusFilter").value : "all";
   const list = state.devices.filter((d) => {
-    if (onlyOnline && !onlineDev(d)) return false;
+    const on = onlineDev(d);
+    if (statusFilter === "online" && !on) return false;
+    if (statusFilter === "offline" && on) return false;
     if (!kw) return true;
     return [d.name, d.ip, d.lanip, d.os].join(" ").toLowerCase().includes(kw);
   });
@@ -1084,7 +1096,41 @@ async function doUpgrade(nodes) {
 }
 
 $("devSearch").addEventListener("input", renderDevices);
-$("devOnlyOnline").addEventListener("change", renderDevices);
+if ($("devStatusFilter")) $("devStatusFilter").addEventListener("change", renderDevices);
+if ($("devOnlyOnline")) $("devOnlyOnline").addEventListener("change", renderDevices);
+
+// 统计概览卡片点击一键筛选
+if ($("statOnlineDev")) {
+  const card = $("statOnlineDev").closest(".stat-card");
+  if (card) {
+    card.style.cursor = "pointer";
+    card.title = "点击筛选：仅看在线设备";
+    card.addEventListener("click", () => {
+      if ($("devStatusFilter")) { $("devStatusFilter").value = "online"; renderDevices(); }
+    });
+  }
+}
+if ($("statOfflineDev")) {
+  const card = $("statOfflineDev").closest(".stat-card");
+  if (card) {
+    card.style.cursor = "pointer";
+    card.title = "点击筛选：仅看离线设备";
+    card.addEventListener("click", () => {
+      if ($("devStatusFilter")) { $("devStatusFilter").value = "offline"; renderDevices(); }
+    });
+  }
+}
+if ($("statTotalDev")) {
+  const card = $("statTotalDev").closest(".stat-card");
+  if (card) {
+    card.style.cursor = "pointer";
+    card.title = "点击查看全部设备";
+    card.addEventListener("click", () => {
+      if ($("devStatusFilter")) { $("devStatusFilter").value = "all"; renderDevices(); }
+    });
+  }
+}
+
 $("devChkAll").addEventListener("change", (ev) => {
   document.querySelectorAll(".dev-chk").forEach((c) => (c.checked = ev.target.checked));
   updateBatchButtons();
