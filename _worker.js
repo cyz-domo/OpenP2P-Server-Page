@@ -207,8 +207,8 @@ export default {
         return jsonRsp({ captcha_id: cid, captchaId: cid, svg });
       }
 
-      // 3. 登录
-      if (pathname === "/api/login" && method === "POST") {
+      // 3. 登录 (支持密码与 Token)
+      if ((pathname === "/api/login" || pathname === "/api/login-token") && method === "POST") {
         const secret = env.SESSION_SECRET || DEFAULT_SECRET;
         let body;
         try {
@@ -232,18 +232,27 @@ export default {
           }
         }
 
+        const token = (body.token || "").trim();
+        const user = (body.user || "").trim();
+        const password = body.password || "";
+        const customUp = (body.upstream || "").trim().replace(/\/+$/, "");
+        if (customUp && (customUp.startsWith("http://") || customUp.startsWith("https://"))) {
+          session.upstream = customUp;
+        }
+        const activeUpstream = session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
+
         if (token) {
-          const profRsp = await fetch(`${upstream}/api/v1/user/profile`, {
+          const profRsp = await fetch(`${activeUpstream}/api/v1/user/profile`, {
             method: "POST",
             headers: { Authorization: token, "Content-Type": "application/json" },
             body: "{}",
           });
-          const profData = await profRsp.json();
+          const profData = await profRsp.json().catch(() => ({ error: -1 }));
           if (profData.error !== 0) {
             return jsonRsp({ error: -1, detail: "Token 无效或已失效" }, 401);
           }
           const loginUser = profData.user || jwtUser(token);
-          const pool = session.accounts.filter((a) => a.user !== loginUser);
+          const pool = (session.accounts || []).filter((a) => a.user !== loginUser);
           pool.push({ user: loginUser, token, password: "" });
           session.accounts = pool;
           session.activeUser = loginUser;
@@ -253,15 +262,15 @@ export default {
         }
 
         if (user && password) {
-          const loginRsp = await fetch(`${upstream}/api/v1/user/login`, {
+          const loginRsp = await fetch(`${activeUpstream}/api/v1/user/login`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ user, password }),
           });
-          const loginData = await loginRsp.json();
+          const loginData = await loginRsp.json().catch(() => ({ error: -1 }));
           if (loginData.error === 0 && loginData.token) {
             const loginUser = loginData.user || user;
-            const pool = session.accounts.filter((a) => a.user !== loginUser);
+            const pool = (session.accounts || []).filter((a) => a.user !== loginUser);
             pool.push({ user: loginUser, token: loginData.token, password });
             session.accounts = pool;
             session.activeUser = loginUser;
@@ -295,7 +304,19 @@ export default {
         return jsonRsp({ error: 0, user: targetUser }, 200, { "Set-Cookie": cookie });
       }
 
-      // 6. 切换官方控制台地址
+      // 6. 移除账户
+      if (pathname === "/api/accounts/remove" && method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const targetUser = body.user;
+        session.accounts = (session.accounts || []).filter((a) => a.user !== targetUser);
+        if (session.activeUser === targetUser) {
+          session.activeUser = session.accounts.length > 0 ? session.accounts[0].user : "";
+        }
+        const cookie = await createSessionCookie(session, env);
+        return jsonRsp({ error: 0, ok: true }, 200, { "Set-Cookie": cookie });
+      }
+
+      // 7. 切换官方控制台地址
       if (pathname === "/api/upstream" && method === "POST") {
         const body = await request.json().catch(() => ({}));
         const newUp = (body.upstream || "").trim().replace(/\/+$/, "");
