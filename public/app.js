@@ -972,7 +972,7 @@ function renderDevices() {
     return `<tr data-node="${esc(d.name)}">
       <td class="col-chk"><input type="checkbox" class="dev-chk" data-node="${esc(d.name)}"></td>
       <td class="col-status"><span class="dot ${on ? "on" : "off"}"></span>${on ? "在线" : "离线"}</td>
-      <td class="col-name col-pinned-end name">${esc(d.name)}</td>
+      <td class="col-name col-pinned-end"><div class="name-scroll" title="${esc(d.name)}"><span>${esc(d.name)}</span></div></td>
       <td class="ip">${copyBtn(d.lanip)}</td>
       <td class="ip">${copyBtn(d.ip)}</td>
       <td>${renderOsTag(d.os, d.name)}</td>
@@ -1107,6 +1107,21 @@ $("devTable").addEventListener("click", (ev) => {
   else if (act === "restart") doRestart([node]);
   else if (act === "upgrade") doUpgrade([node]);
   else if (act === "delete") doDeleteDevices([node]);
+});
+$("devTable").addEventListener("mouseover", (ev) => {
+  const el = ev.target.closest(".name-scroll");
+  if (!el || el._scrolling) return;
+  const max = el.scrollWidth - el.clientWidth;
+  if (max > 0) {
+    el._scrolling = true;
+    el.scrollTo({ left: max, behavior: "smooth" });
+  }
+});
+$("devTable").addEventListener("mouseout", (ev) => {
+  const el = ev.target.closest(".name-scroll");
+  if (!el) return;
+  el._scrolling = false;
+  el.scrollTo({ left: 0, behavior: "smooth" });
 });
 $("btnBatchRestart").addEventListener("click", () => doRestart(selNodes()));
 $("btnBatchUpgrade").addEventListener("click", () => doUpgrade(selNodes()));
