@@ -5,6 +5,10 @@
 
 纯 Python 标准库 + 原生现代 HTML5/CSS3/ES6，**零第三方依赖，无需构建，极速秒开**，任何能跑 Python 3.8+ 的 Linux、macOS 或 Windows 系统即可一键部署。
 
+同时提供 **100% Serverless 边缘运行分支**（无需任何服务器与 Python 环境）：
+- 🌐 **腾讯云 EdgeOne 分支 (`edgeone`)**：适配腾讯云 EdgeOne Makers，支持 `edgeone makers deploy` 一键上线。
+- ☁️ **Cloudflare Workers 分支 (`cloudflare`)**：适配 Cloudflare Workers / Pages，支持 `wrangler deploy` 一键上线。
+
 ---
 
 ## 🌟 核心功能对照（相对官方控制台的增强）
