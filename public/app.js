@@ -1190,7 +1190,7 @@ function renderTunnels() {
       value: d.name,
       label: d.name,
       online: onlineDev(d),
-      subtext: `${d.ip || "-"}${d.os ? " · " + d.os : ""}`
+      subtext: `${onlineDev(d) ? "🟢 在线" : "⚪ 离线"} · ${d.ip || "-"}${d.os ? " · " + d.os : ""}`
     }))
   ];
   if (tlNodeFilterSS) {
@@ -1198,6 +1198,7 @@ function renderTunnels() {
     tlNodeFilterSS.setValue(curFilter);
   }
   const nodeFilter = tlNodeFilterSS ? tlNodeFilterSS.getValue() : ($("tlNodeFilter").value || "");
+  const stateFilter = $("tlStateFilter") ? $("tlStateFilter").value : "all";
   const kw = $("tlSearch").value.trim().toLowerCase();
 
 
@@ -1222,7 +1223,7 @@ function renderTunnels() {
     return { txt: "重试中", cls: "cs-wait", key: "wait" };
   };
 
-    const rows = [];
+  const rows = [];
   for (const [node, apps] of Object.entries(state.tunnelByNode)) {
     if (nodeFilter && node !== nodeFilter) continue;
     for (const a of apps) {
@@ -1243,9 +1244,32 @@ function renderTunnels() {
   } else if (tunnelSort.key === "state") {
     rows.sort((x, y) => ((stateOrder[x.cs.key] ?? 9) - (stateOrder[y.cs.key] ?? 9)) * tunnelSort.dir);
   }
+
+  // 状态筛选器动态数量更新
+  const currentTabAllRows = rows.filter((r) => r.t === tlSub);
+  const totalCount = currentTabAllRows.length;
+  const okCount = currentTabAllRows.filter((r) => r.cs.key === "ok").length;
+  const waitCount = currentTabAllRows.filter((r) => r.cs.key === "wait").length;
+  const peeroffCount = currentTabAllRows.filter((r) => r.cs.key === "peeroff").length;
+  const offCount = currentTabAllRows.filter((r) => r.cs.key === "off").length;
+
+  if ($("tlStateFilter") && $("tlStateFilter").options.length >= 5) {
+    const curVal = $("tlStateFilter").value || "all";
+    $("tlStateFilter").options[0].textContent = `全部状态 (${totalCount})`;
+    $("tlStateFilter").options[1].textContent = `🟢 仅看已连接 (${okCount})`;
+    $("tlStateFilter").options[2].textContent = `⏳ 连接中 / 重试中 (${waitCount})`;
+    $("tlStateFilter").options[3].textContent = `⚪ 对端离线 / 等待中 (${peeroffCount})`;
+    $("tlStateFilter").options[4].textContent = `🚫 仅看已停用 (${offCount})`;
+    $("tlStateFilter").options[4].style.display = tlSub === "sd" ? "none" : "";
+    $("tlStateFilter").value = curVal;
+  }
+
+  // 按状态过滤
+  const filteredRows = stateFilter === "all" ? rows : rows.filter((r) => r.cs.key === stateFilter);
+
   // 拆分：端口转发 → tlTable；组网隧道 → sdTable
-  const pfRows = rows.filter((r) => r.t === "pf");
-  const sdRows = rows.filter((r) => r.t === "sd");
+  const pfRows = filteredRows.filter((r) => r.t === "pf");
+  const sdRows = filteredRows.filter((r) => r.t === "sd");
   if (!$("cntPf") || !$("cntSd") || !$("tlSummary")) return; // 视图元素未就绪（极端时序）直接跳过本轮渲染
   $("cntPf").textContent = pfRows.length;
   $("cntSd").textContent = sdRows.length;
@@ -1341,6 +1365,7 @@ document.querySelectorAll("#tlTable th.sortable, #sdTable th.sortable").forEach(
 );
 $("tlSearch").addEventListener("input", renderTunnels);
 $("tlNodeFilter").addEventListener("change", renderTunnels);
+if ($("tlStateFilter")) $("tlStateFilter").addEventListener("change", renderTunnels);
 
 $("tlTable").addEventListener("click", async (ev) => {
   const btn = ev.target.closest("button[data-act]");
