@@ -1,0 +1,13 @@
+{
+  "name": "openp2p-panel-cloudflare",
+  "version": "1.0.0",
+  "description": "OpenP2P Management Console on Cloudflare Workers / Pages",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.100.0"
+  },
+  "keywords": ["openp2p", "cloudflare-workers", "cloudflare-pages", "serverless"]
+}

@@ -1,0 +1,13 @@
+name = "openp2p-panel"
+main = "_worker.js"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[vars]
+UPSTREAM_URL = "https://console.openpxp.com"
+# PANEL_KEY = "your-panel-password"
+# SESSION_SECRET = "your-custom-session-secret-key"
