@@ -567,11 +567,14 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     # ---------- 路由 ----------
+    def _is_proxy(self):
+        return self.path.startswith("/pxp/") or self.path.startswith("/api/pxp/")
+
     def do_GET(self):
         if not self._authorized():
             self._json({"error": 401, "detail": "需要访问口令"}, 401)
             return
-        if self.path.startswith(API_PREFIX):
+        if self._is_proxy():
             self._proxy("GET")
         elif self.path.startswith("/api/"):
             self._panel_api("GET")
@@ -582,7 +585,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json({"error": 401, "detail": "需要访问口令"}, 401)
             return
-        if self.path.startswith(API_PREFIX):
+        if self._is_proxy():
             self._proxy("POST")
         elif self.path.startswith("/api/"):
             self._panel_api("POST")
@@ -593,7 +596,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json({"error": 401, "detail": "需要访问口令"}, 401)
             return
-        if self.path.startswith(API_PREFIX):
+        if self._is_proxy():
             self._proxy("PUT")
         else:
             self._send(404, b"not found", "text/plain")
@@ -833,7 +836,12 @@ class Handler(BaseHTTPRequestHandler):
     def _proxy(self, method: str):
         from urllib.parse import urlparse
 
-        path = self.path[len(API_PREFIX) - 1:]  # 保留前导 /
+        if self.path.startswith("/api/pxp/"):
+            path = self.path[len("/api/pxp/") - 1:]
+        elif self.path.startswith(API_PREFIX):
+            path = self.path[len(API_PREFIX) - 1:]  # 保留前导 /
+        else:
+            path = self.path
         # 只放行官方 API 路径，阻断 /pxp/../ 与绝对 URI 形式的代理滥用
         if not urlparse(path).path.startswith(_PROXY_ALLOW):
             self._send(403, b"forbidden", "text/plain")
