@@ -102,11 +102,12 @@ function generateCaptchaSvg(code, theme = "dark") {
     chars += `<text x="${x}" y="${y}" text-anchor="middle" font-family="Consolas,monospace" font-size="24" font-weight="bold" fill="${color}">${code[i]}</text>`;
   }
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 {W} {H}">` +
-    `<rect width="${W}" height="${H}" fill="${bg}" rx="6"/>` +
+  const svgXml = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="44" viewBox="0 0 120 44">` +
+    `<rect width="120" height="44" fill="${bg}" rx="6"/>` +
     `<line x1="10" y1="12" x2="110" y2="34" stroke="${noise}" stroke-width="1"/>` +
     `<line x1="10" y1="36" x2="110" y2="10" stroke="${noise}" stroke-width="1"/>` +
     `${chars}</svg>`;
+  return "data:image/svg+xml;utf8," + encodeURIComponent(svgXml);
 }
 
 /* ---------------- 会话管理 ---------------- */
@@ -197,13 +198,13 @@ export default {
       }
 
       // 2. 验证码
-      if (pathname === "/api/captcha" && method === "GET") {
+      if (pathname === "/api/captcha" && (method === "GET" || method === "POST")) {
         const secret = env.SESSION_SECRET || DEFAULT_SECRET;
-        const theme = url.searchParams.get("theme") || "dark";
+        const theme = url.searchParams.get("theme") || request.headers.get("X-Panel-Theme") || "dark";
         const code = Math.floor(1000 + Math.random() * 9000).toString();
         const cid = await signData(JSON.stringify({ code, exp: Date.now() + 300000 }), secret);
         const svg = generateCaptchaSvg(code, theme);
-        return jsonRsp({ captcha_id: cid, svg });
+        return jsonRsp({ captcha_id: cid, captchaId: cid, svg });
       }
 
       // 3. 登录
@@ -216,13 +217,14 @@ export default {
           return jsonRsp({ error: -1, detail: "请求格式错误" }, 400);
         }
 
-        const { captcha_id, captcha_code, user, password, token } = body;
-        if (captcha_id && captcha_code) {
-          const verified = await verifyData(captcha_id, secret);
+        const cid = body.captchaId || body.captcha_id;
+        const ccode = body.captcha || body.captcha_code;
+        if (cid && ccode) {
+          const verified = await verifyData(cid, secret);
           if (!verified) return jsonRsp({ error: -1, detail: "验证码已过期或无效" }, 400);
           try {
             const parsed = JSON.parse(verified);
-            if (Date.now() > parsed.exp || parsed.code !== String(captcha_code).trim()) {
+            if (Date.now() > parsed.exp || parsed.code !== String(ccode).trim()) {
               return jsonRsp({ error: -1, detail: "验证码错误或已失效" }, 400);
             }
           } catch {
