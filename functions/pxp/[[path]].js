@@ -79,13 +79,8 @@ async function verifyData(signedStr, secret) {
       );
       _cachedHmacSecret = currentSecret;
     }
-      new TextEncoder().encode(secret || DEFAULT_SECRET),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["verify"]
-    );
     const sigBytes = base64UrlDecodeBytes(b64Sig);
-    const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(rawData));
+    const valid = await crypto.subtle.verify("HMAC", _cachedHmacKey, sigBytes, new TextEncoder().encode(rawData));
     return valid ? rawData : null;
   } catch {
     return null;
