@@ -258,7 +258,10 @@ function jsonRsp(data, status = 200, extraHeaders = {}) {
 export default async function handler(request) {
   const env = getEnv();
   const url = new URL(request.url);
-  const pathname = url.pathname;
+  const rawPath = url.searchParams.get("_vercel_path") || request.headers.get("x-matched-path") || request.headers.get("x-forwarded-uri") || url.pathname;
+  url.searchParams.delete("_vercel_path");
+  
+  const pathname = rawPath.split("?")[0];
   const method = request.method;
 
   // 口令鉴权
@@ -270,7 +273,7 @@ export default async function handler(request) {
     }
   }
 
-  // ---------- 反向代理 /pxp/* 路由（含 rewrite 后的 /api/pxp/*）----------
+  // ---------- 反向代理 /pxp/* 路由（含 /api/pxp/* 与 rewrite 路由）----------
   if (pathname.startsWith("/api/pxp/") || pathname.startsWith("/pxp/")) {
     const session = await getSession(request);
     let upstream = session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
