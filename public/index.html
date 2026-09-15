@@ -240,6 +240,15 @@
         <div class="select-wrap">
           <select id="tlNodeFilter" class="input sel" title="按所在设备筛选"></select>
         </div>
+        <div class="select-wrap">
+          <select id="tlStateFilter" class="input sel" title="按在线/连接状态筛选">
+            <option value="all">全部连接状态</option>
+            <option value="ok">🟢 仅看已连接</option>
+            <option value="wait">⏳ 连接中 / 重试中</option>
+            <option value="peeroff">⚪ 对端离线 / 等待中</option>
+            <option value="off">🚫 仅看已停用</option>
+          </select>
+        </div>
         <div class="search-input-wrap">
           <svg class="search-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           <input id="tlSearch" class="input input-search" placeholder="搜索规则名 / 对端 / 目标…">
