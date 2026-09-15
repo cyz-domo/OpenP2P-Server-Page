@@ -247,7 +247,7 @@ export default {
       const upstream = session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
 
       // 1. 面板状态
-      if (pathname === "/api/state" && method === "GET") {
+      if (pathname === "/api/state" && (method === "GET" || method === "HEAD")) {
         const pool = session.accounts || [];
         const user = session.activeUser || "";
         const acc = pool.find((a) => a.user === user);
