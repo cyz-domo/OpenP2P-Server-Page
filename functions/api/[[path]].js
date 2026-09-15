@@ -33,17 +33,26 @@ function base64UrlDecode(str) {
   return new TextDecoder().decode(base64UrlDecodeBytes(str));
 }
 
-/* ---------------- AES-GCM-256 加密存储与 HMAC 签名 ---------------- */
+/* ---------------- AES-GCM-256 加密存储与 HMAC 签名 (带内存 Key 单例缓存) ---------------- */
+let _cachedAesKey = null;
+let _cachedAesSecret = null;
+
 async function getDerivedAesKey(secret) {
+  const currentSecret = secret || DEFAULT_SECRET;
+  if (_cachedAesKey && _cachedAesSecret === currentSecret) {
+    return _cachedAesKey;
+  }
   const enc = new TextEncoder();
-  const baseKey = await crypto.subtle.importKey("raw", enc.encode(secret || DEFAULT_SECRET), "PBKDF2", false, ["deriveKey"]);
-  return await crypto.subtle.deriveKey(
+  const baseKey = await crypto.subtle.importKey("raw", enc.encode(currentSecret), "PBKDF2", false, ["deriveKey"]);
+  _cachedAesKey = await crypto.subtle.deriveKey(
     { name: "PBKDF2", salt: enc.encode("openp2p-salt-2026"), iterations: 10000, hash: "SHA-256" },
     baseKey,
     { name: "AES-GCM", length: 256 },
     false,
     ["encrypt", "decrypt"]
   );
+  _cachedAesSecret = currentSecret;
+  return _cachedAesKey;
 }
 
 async function encryptData(plainText, secret) {
@@ -70,14 +79,23 @@ async function decryptData(cipherB64, secret) {
   }
 }
 
+let _cachedHmacKey = null;
+let _cachedHmacSecret = null;
+
 async function getHmacKey(secret) {
-  return await crypto.subtle.importKey(
+  const currentSecret = secret || DEFAULT_SECRET;
+  if (_cachedHmacKey && _cachedHmacSecret === currentSecret) {
+    return _cachedHmacKey;
+  }
+  _cachedHmacKey = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(secret || DEFAULT_SECRET),
+    new TextEncoder().encode(currentSecret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign", "verify"]
   );
+  _cachedHmacSecret = currentSecret;
+  return _cachedHmacKey;
 }
 
 async function signData(dataStr, secret) {
