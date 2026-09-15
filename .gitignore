@@ -9,6 +9,10 @@ server2.log
 __pycache__/
 *.pyc
 *.pyo
+.edgeone/
+.wrangler/
+node_modules/
+
 
 # 编辑器和系统文件
 .vscode/

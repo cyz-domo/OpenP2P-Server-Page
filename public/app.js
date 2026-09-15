@@ -554,8 +554,12 @@ async function reloadCaptcha() {
     const headers = panelHeaders({ "Content-Type": "application/json", "X-Panel-Theme": document.documentElement.dataset.theme || "dark" });
     const rsp = await fetch(`/api/captcha?_t=${Date.now()}`, { method: "POST", headers, credentials: "same-origin", cache: "no-store" });
     const data = await rsp.json();
-    captchaId = data.captchaId || "";
-    if ($("captchaImg")) $("captchaImg").src = data.svg || "";
+    captchaId = data.captchaId || data.captcha_id || "";
+    let svgSrc = data.svg || "";
+    if (svgSrc && !svgSrc.startsWith("data:") && svgSrc.startsWith("<svg")) {
+      svgSrc = "data:image/svg+xml;utf8," + encodeURIComponent(svgSrc);
+    }
+    if ($("captchaImg")) $("captchaImg").src = svgSrc;
     if ($("loginCaptcha")) $("loginCaptcha").value = "";
   } catch (e) {
     if ($("captchaImg")) $("captchaImg").alt = "验证码加载失败";
