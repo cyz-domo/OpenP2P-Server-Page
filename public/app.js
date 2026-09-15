@@ -970,9 +970,9 @@ function renderDevices() {
     const on = onlineDev(d);
     const upd = d.version !== state.latestVer && state.latestVer;
     return `<tr data-node="${esc(d.name)}">
-      <td><input type="checkbox" class="dev-chk" data-node="${esc(d.name)}"></td>
-      <td><span class="dot ${on ? "on" : "off"}"></span>${on ? "在线" : "离线"}</td>
-      <td class="name">${esc(d.name)}</td>
+      <td class="col-chk"><input type="checkbox" class="dev-chk" data-node="${esc(d.name)}"></td>
+      <td class="col-status"><span class="dot ${on ? "on" : "off"}"></span>${on ? "在线" : "离线"}</td>
+      <td class="col-name col-pinned-end name">${esc(d.name)}</td>
       <td class="ip">${copyBtn(d.lanip)}</td>
       <td class="ip">${copyBtn(d.ip)}</td>
       <td>${renderOsTag(d.os, d.name)}</td>

@@ -26,8 +26,12 @@
   ],
   "rewrites": [
     {
-      "source": "/pxp/:match*",
-      "destination": "/api/pxp/:match*"
+      "source": "/api/(.*)",
+      "destination": "/api?_vercel_path=/api/$1"
+    },
+    {
+      "source": "/pxp/(.*)",
+      "destination": "/api?_vercel_path=/api/pxp/$1"
     }
   ]
 }

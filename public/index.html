@@ -211,10 +211,12 @@
       </div>
 
       <div class="table-wrap">
-        <table class="tbl" id="devTable">
+        <table class="tbl tbl-sticky-dev" id="devTable">
           <thead><tr>
-            <th width="40"><input id="devChkAll" type="checkbox"></th>
-            <th>状态</th><th>设备名</th><th>内网 IP</th><th>公网 IP</th><th>系统环境</th>
+            <th class="col-chk" width="40"><input id="devChkAll" type="checkbox"></th>
+            <th class="col-status">状态</th>
+            <th class="col-name col-pinned-end">设备名</th>
+            <th>内网 IP</th><th>公网 IP</th><th>系统环境</th>
             <th>NAT 类型</th><th>版本</th><th>带宽上限</th><th>最近活跃时间</th><th class="th-op">操作</th>
           </tr></thead>
           <tbody></tbody>
