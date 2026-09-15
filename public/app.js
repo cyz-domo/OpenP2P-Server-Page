@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const API = "/pxp"; // 反向代理前缀
+const API = "/api/pxp"; // 反向代理前缀 (统一走 /api/ 路由以适配 Vercel/Edge/Server)
 
 /* ---------------- 状态 ---------------- */
 const tunnelSort = { key: "state", dir: 1 }; // 隧道表排序（默认按连接状态，已连接在前）
