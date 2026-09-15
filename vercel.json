@@ -23,5 +23,11 @@
         }
       ]
     }
+  ],
+  "rewrites": [
+    {
+      "source": "/pxp/:match*",
+      "destination": "/api/pxp/:match*"
+    }
   ]
 }
