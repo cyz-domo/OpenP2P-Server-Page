@@ -78,7 +78,22 @@ function pushCmd(node, subtype, body, rsp = 0) {
   return pxp(`/api/v1/device/${encodeURIComponent(node)}/push?${q}`, { method: "POST", body: body || {} });
 }
 
-function fmtTime(s) { return s ? String(s).replace("T", " ").slice(0, 19) : "-"; }
+function fmtTime(s, fallback = "-") {
+  if (!s) return fallback;
+  if (typeof s === "number" || /^\d{10,13}$/.test(String(s).trim())) {
+    const ms = Number(s) < 1e11 ? Number(s) * 1000 : Number(s);
+    if (isNaN(ms) || ms <= 0) return fallback;
+    const d = new Date(ms);
+    if (isNaN(d.getTime()) || d.getFullYear() <= 1970) return fallback;
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+  const str = String(s).replace("T", " ").slice(0, 19);
+  if (str.startsWith("0001-01-01") || str.startsWith("1970-01-01") || str.startsWith("0000-00-00")) {
+    return fallback;
+  }
+  return str;
+}
 function onlineDev(d) { return d.isActive === 1; }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -991,7 +1006,7 @@ function renderDevices() {
       <td><span class="tag">NAT${esc(d.natType ?? "-")}</span></td>
       <td>${esc(d.version || "-")}${upd ? ` <a class="tag" style="color:var(--amber)">可升级</a>` : ""}</td>
       <td>${esc(d.bandwidth ?? "-")}</td>
-      <td>${esc(fmtTime(d.activetime))}</td>
+      <td>${esc(fmtTime(d.activetime, on ? "活跃中" : "-"))}</td>
       <td class="op">
         <button class="btn" data-act="tunnels">规则</button>
         <button class="btn" data-act="editdev">编辑</button>
@@ -1216,7 +1231,8 @@ function renderTunnels() {
   const connStateOf = (a, node) => {
     if (!isEnabled(a, node)) return { txt: "已停用", cls: "cs-off", key: "off" };
     if (a.isActive === 1) return { txt: "✅ 已连接", cls: "cs-ok", key: "ok" };
-    const never = !a.connectTime || String(a.connectTime).startsWith(ZERO_TIME);
+    const rawTime = a.connectTime || a.ConnectTime || a.lastConnectTime || a.activeTime;
+    const never = !rawTime || String(rawTime).startsWith(ZERO_TIME) || String(rawTime).startsWith("1970-01-01");
     const peerDev = devMap[a.peerNode];
     if (peerDev && !onlineDev(peerDev)) return { txt: "等待对端上线", cls: "cs-wait", key: "peeroff" };
     if (never) return { txt: "正在连接…", cls: "cs-wait", key: "wait" };
@@ -1315,6 +1331,9 @@ function renderTunnels() {
     const relay = a.specRelayNode || a.relayNode || "";
     const peerIp = a.peerIP || "-";
     const nat = a.peerNatType != null ? "NAT" + a.peerNatType : "-";
+    const rawTime = a.connectTime || a.ConnectTime || a.lastConnectTime || a.activeTime;
+    const timeFormatted = fmtTime(rawTime, "");
+    const timeHtml = timeFormatted ? esc(timeFormatted) : (a.isActive === 1 ? `<span class="muted" title="长连接持续活跃中（客户端未产生重连时间戳）">持续活跃中</span>` : `<span class="muted">-</span>`);
     return `<tr>
       <td>${esc(node)}${dev && !onlineDev(dev) ? ' <span class="tag">离线</span>' : ""}</td>
       <td class="name">${esc(a.peerNode || "-")}${peerDev && !onlineDev(peerDev) ? ' <span class="tag">对端离线</span>' : ""}</td>
@@ -1323,7 +1342,7 @@ function renderTunnels() {
       <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
       <td class="relay">${relay ? esc(relay) : '<span class="muted">P2P 直连</span>'}</td>
       <td class="${cs.cls}">${cs.txt}</td>
-      <td class="ip">${esc(fmtTime(a.connectTime))}</td>
+      <td class="ip">${timeHtml}</td>
     </tr>`;
     }).join("") || `<tr><td colspan="8" class="muted" style="text-align:center">无组网隧道</td></tr>`;
   }
@@ -1839,13 +1858,16 @@ function renderMemApps() {
   const tbody = $("memTable").querySelector("tbody");
   tbody.innerHTML = state.memApps.map((a) => {
     const relay = a.specRelayNode || a.relayNode || "";
+    const rawTime = a.connectTime || a.ConnectTime || a.lastConnectTime || a.activeTime;
+    const timeFormatted = fmtTime(rawTime, "");
+    const timeHtml = timeFormatted ? esc(timeFormatted) : (a.isActive ? `<span class="muted" title="长连接持续活跃中（客户端未产生重连时间戳）">持续活跃中</span>` : `<span class="muted">-</span>`);
     return `<tr>
       <td>${esc(curMember)}</td>
       <td class="name">${esc(a.peerNode || "-")}</td>
       <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
       <td class="relay">${relay ? esc(relay) : '<span class="muted">P2P 直连</span>'}</td>
       <td>${a.isActive ? "✅ 活跃" : (a.enabled === 0 ? "⏸ 停用" : "· 未连接")}</td>
-      <td>${esc(fmtTime(a.connectTime))}</td>
+      <td>${timeHtml}</td>
     </tr>`;
   }).join("") || `<tr><td colspan="6" class="muted" style="text-align:center">点击右上「查看」读取所选成员的隧道状态</td></tr>`;
 }
