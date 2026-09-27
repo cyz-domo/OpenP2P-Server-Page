@@ -259,6 +259,78 @@ export default {
       }
     }
 
+    // ---------- 反向代理 /api/pxp/* 与 /pxp/* 路由 ----------
+    if (pathname.startsWith("/api/pxp/") || pathname.startsWith("/pxp/")) {
+      const session = await getSession(request, env);
+      let upstream = session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
+      
+      try {
+        const upUrl = new URL(upstream);
+        if (upUrl.protocol !== "https:" || isPrivateHost(upUrl.hostname)) {
+          upstream = DEFAULT_UPSTREAM;
+        }
+      } catch {
+        upstream = DEFAULT_UPSTREAM;
+      }
+
+      const subPath = pathname.replace(/^\/api\/pxp/, "").replace(/^\/pxp/, "");
+      const acc = (session.accounts || []).find((a) => a.user === session.activeUser);
+      let token = acc ? acc.token : "";
+
+      // 自动刷新 Token
+      if (acc && acc.password && (!token || jwtExp(token) < Date.now() / 1000 + 60)) {
+        try {
+          const r = await fetch(`${upstream}/api/v1/user/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ user: acc.user, password: acc.password }),
+          });
+          const d = await r.json();
+          if (d.error === 0 && d.token) {
+            token = d.token;
+            acc.token = token;
+          }
+        } catch {}
+      }
+
+      const targetUrl = `${upstream}${subPath}${url.search}`;
+      const fwdHeaders = new Headers();
+      for (const [k, v] of request.headers.entries()) {
+        const lk = k.toLowerCase();
+        if (["host", "cookie", "connection", "accept-encoding", "content-length"].includes(lk)) continue;
+        fwdHeaders.set(k, v);
+      }
+      fwdHeaders.set("Host", new URL(upstream).host);
+      if (token) fwdHeaders.set("Authorization", token);
+
+      try {
+        const reqBody = ["GET", "HEAD"].includes(method) ? undefined : await request.arrayBuffer();
+        const upstreamRsp = await fetch(targetUrl, {
+          method,
+          headers: fwdHeaders,
+          body: reqBody,
+          redirect: "follow",
+        });
+
+        const respData = await upstreamRsp.arrayBuffer();
+        const respHeaders = new Headers(upstreamRsp.headers);
+        respHeaders.delete("content-encoding");
+        respHeaders.delete("content-length");
+        respHeaders.delete("transfer-encoding");
+        respHeaders.delete("connection");
+        respHeaders.delete("keep-alive");
+        respHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate");
+        applySecurityHeaders(respHeaders);
+
+        return new Response(respData, {
+          status: upstreamRsp.status,
+          headers: respHeaders,
+        });
+      } catch (err) {
+        return jsonRsp({ error: -2, detail: `Upstream error: ${err.message}` }, 502);
+      }
+    }
+
     // ---------- API 路由 ----------
     if (pathname.startsWith("/api/")) {
       const session = await getSession(request, env);
@@ -294,6 +366,109 @@ export default {
         const cid = await signData(JSON.stringify({ code, nonce, exp: Date.now() + 120000 }), secret);
         const svg = generateCaptchaSvg(code, theme);
         return jsonRsp({ captcha_id: cid, captchaId: cid, svg });
+      }
+
+      // 2.1 通行密钥 (Passkey) - 获取 Challenge
+      if (pathname === "/api/passkey/challenge" && (method === "GET" || method === "POST")) {
+        const challengeBytes = new Uint8Array(32);
+        crypto.getRandomValues(challengeBytes);
+        return jsonRsp({ error: 0, challenge: base64UrlEncode(challengeBytes) });
+      }
+
+      // 2.2 通行密钥 (Passkey) - 绑定凭据 (需在登录态下执行)
+      if (pathname === "/api/passkey/bind" && method === "POST") {
+        const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+        if (!session.activeUser) {
+          return jsonRsp({ error: 401, detail: "请先登录后再绑定通行密钥" }, 401);
+        }
+        const acc = (session.accounts || []).find((a) => a.user === session.activeUser);
+        if (!acc) return jsonRsp({ error: 401, detail: "未找到当前账户凭据" }, 401);
+
+        let body;
+        try { body = await request.json(); } catch { return jsonRsp({ error: -1, detail: "参数错误" }, 400); }
+
+        const credentialId = (body.credentialId || "").trim();
+        const deviceName = (body.deviceName || "当前设备").trim();
+        if (!credentialId) return jsonRsp({ error: -1, detail: "缺少凭据标识" }, 400);
+
+        const passkeyPayload = {
+          credentialId,
+          user: acc.user,
+          token: acc.token,
+          password: acc.password || "",
+          upstream: session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM,
+          deviceName,
+          createdAt: Date.now()
+        };
+
+        const passkeyCipher = await encryptData(JSON.stringify(passkeyPayload), secret);
+        return jsonRsp({
+          error: 0,
+          credentialId,
+          passkeyCipher,
+          user: acc.user,
+          deviceName,
+          createdAt: passkeyPayload.createdAt
+        });
+      }
+
+      // 2.3 通行密钥 (Passkey) - 验证登录
+      if (pathname === "/api/passkey/login" && method === "POST") {
+        const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+        let body;
+        try { body = await request.json(); } catch { return jsonRsp({ error: -1, detail: "参数错误" }, 400); }
+
+        const credentialId = (body.credentialId || "").trim();
+        const passkeyCipher = (body.passkeyCipher || "").trim();
+        if (!credentialId || !passkeyCipher) {
+          return jsonRsp({ error: -1, detail: "通行密钥凭据不完整" }, 400);
+        }
+
+        const decryptedStr = await decryptData(passkeyCipher, secret);
+        if (!decryptedStr) {
+          return jsonRsp({ error: 401, detail: "通行密钥凭据已失效或损坏，请重新绑定" }, 401);
+        }
+
+        let payload;
+        try { payload = JSON.parse(decryptedStr); } catch { return jsonRsp({ error: -1, detail: "凭据解析失败" }, 400); }
+        if (payload.credentialId !== credentialId) {
+          return jsonRsp({ error: 401, detail: "凭据指纹不匹配" }, 401);
+        }
+
+        const loginUser = payload.user;
+        let token = payload.token;
+        const targetUpstream = payload.upstream || session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
+
+        if (!token || jwtExp(token) < Date.now() / 1000 + 60) {
+          if (payload.password) {
+            const r = await fetch(`${targetUpstream}/api/v1/user/login`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ user: loginUser, password: payload.password }),
+            }).catch(() => null);
+            if (r) {
+              const d = await r.json().catch(() => null);
+              if (d && d.error === 0 && d.token) token = d.token;
+            }
+          }
+        }
+
+        const pool = (session.accounts || []).filter((a) => a.user !== loginUser);
+        pool.push({ user: loginUser, token, password: payload.password || "" });
+        session.accounts = pool;
+        session.activeUser = loginUser;
+        session.upstream = targetUpstream;
+
+        const cookie = await createSessionCookie(session, env);
+        return jsonRsp({
+          error: 0,
+          user: loginUser,
+          token,
+          credentialId,
+          passkeyCipher,
+          deviceName: payload.deviceName || "当前设备",
+          createdAt: payload.createdAt || Date.now()
+        }, 200, { "Set-Cookie": cookie });
       }
 
       // 3. 登录 (支持密码与 Token 登录)
@@ -421,66 +596,6 @@ export default {
       }
 
       return jsonRsp({ error: -1, detail: "未知接口" }, 404);
-    }
-
-    // ---------- 反向代理 /pxp/* ----------
-    if (pathname.startsWith("/pxp/")) {
-      const session = await getSession(request, env);
-      let upstream = session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
-      
-      try {
-        const upUrl = new URL(upstream);
-        if (upUrl.protocol !== "https:" || isPrivateHost(upUrl.hostname)) {
-          upstream = DEFAULT_UPSTREAM;
-        }
-      } catch {
-        upstream = DEFAULT_UPSTREAM;
-      }
-
-      const subPath = pathname.slice(4);
-      const acc = (session.accounts || []).find((a) => a.user === session.activeUser);
-      let token = acc ? acc.token : "";
-
-      // 自动刷新 Token
-      if (acc && acc.password && (!token || jwtExp(token) < Date.now() / 1000 + 60)) {
-        try {
-          const r = await fetch(`${upstream}/api/v1/user/login`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ user: acc.user, password: acc.password }),
-          });
-          const d = await r.json();
-          if (d.error === 0 && d.token) {
-            token = d.token;
-            acc.token = token;
-          }
-        } catch {}
-      }
-
-      const targetUrl = `${upstream}${subPath}${url.search}`;
-      const fwdHeaders = new Headers(request.headers);
-      fwdHeaders.delete("host");
-      fwdHeaders.delete("cookie");
-      if (token) fwdHeaders.set("Authorization", token);
-
-      try {
-        const upstreamRsp = await fetch(targetUrl, {
-          method,
-          headers: fwdHeaders,
-          body: ["GET", "HEAD"].includes(method) ? undefined : await request.arrayBuffer(),
-          redirect: "follow",
-        });
-
-        const respHeaders = new Headers(upstreamRsp.headers);
-        respHeaders.set("Cache-Control", "no-store");
-        applySecurityHeaders(respHeaders);
-        return new Response(upstreamRsp.body, {
-          status: upstreamRsp.status,
-          headers: respHeaders,
-        });
-      } catch (err) {
-        return jsonRsp({ error: -2, detail: `Upstream error: ${err.message}` }, 502);
-      }
     }
 
     // ---------- 静态资源响应 (注入安全头) ----------
