@@ -768,6 +768,11 @@ class Handler(BaseHTTPRequestHandler):
                 "deviceName": dev_name,
                 "createdAt": int(time.time() * 1000),
             }
+            if "passkeys" not in _upstream.cfg:
+                _upstream.cfg["passkeys"] = {}
+            _upstream.cfg["passkeys"][cred_id] = payload
+            save_config(_upstream.cfg)
+
             cipher = obf_encode(json.dumps(payload))
             self._json({
                 "error": 0,
@@ -785,13 +790,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             cred_id = (data.get("credentialId") or "").strip()
             cipher = (data.get("passkeyCipher") or "").strip()
-            if not cred_id or not cipher:
-                self._json({"error": -1, "detail": "通行密钥凭据不完整"}, 400)
+            if not cred_id:
+                self._json({"error": -1, "detail": "缺少凭据标识"}, 400)
                 return
-            try:
-                decrypted = obf_decode(cipher)
-                payload = json.loads(decrypted)
-            except Exception:
+            payload = None
+            if cipher:
+                try:
+                    decrypted = obf_decode(cipher)
+                    payload = json.loads(decrypted)
+                except Exception:
+                    pass
+            if not payload and cred_id in _upstream.cfg.get("passkeys", {}):
+                payload = _upstream.cfg["passkeys"][cred_id]
+            if not payload:
                 self._json({"error": 401, "detail": "通行密钥凭据已失效或损坏，请重新绑定"}, 401)
                 return
             if payload.get("credentialId") != cred_id:
