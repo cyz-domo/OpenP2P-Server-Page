@@ -226,10 +226,17 @@ export async function onRequest(context) {
       redirect: "follow",
     });
 
+    const respData = await upstreamRsp.arrayBuffer();
     const respHeaders = new Headers(upstreamRsp.headers);
-    respHeaders.set("Cache-Control", "no-store");
+    respHeaders.delete("content-encoding");
+    respHeaders.delete("content-length");
+    respHeaders.delete("transfer-encoding");
+    respHeaders.delete("connection");
+    respHeaders.delete("keep-alive");
+    respHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate");
     applySecurityHeaders(respHeaders);
-    return new Response(upstreamRsp.body, {
+
+    return new Response(respData, {
       status: upstreamRsp.status,
       headers: respHeaders,
     });
