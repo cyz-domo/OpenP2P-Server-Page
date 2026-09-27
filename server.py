@@ -735,6 +735,81 @@ class Handler(BaseHTTPRequestHandler):
             save_config(_upstream.cfg)
             print(f"[panel] 官方代理上游地址已更新为: {new_up}")
             self._json({"error": 0, "upstream": new_up})
+        elif req_path == "/api/passkey/challenge" and method in ("GET", "POST"):
+            challenge_bytes = secrets.token_bytes(32)
+            challenge_b64 = base64.urlsafe_b64encode(challenge_bytes).decode().rstrip("=")
+            self._json({"error": 0, "challenge": challenge_b64})
+        elif req_path == "/api/passkey/bind" and method == "POST":
+            if not session or not session.get("activeUser"):
+                self._json({"error": 401, "detail": "请先登录后再绑定通行密钥"}, 401)
+                return
+            try:
+                data = json.loads(raw.decode() or "{}")
+            except Exception:
+                self._json({"error": -1, "detail": "请求格式错误"}, 400)
+                return
+            cred_id = (data.get("credentialId") or "").strip()
+            dev_name = (data.get("deviceName") or "当前设备").strip()
+            if not cred_id:
+                self._json({"error": -1, "detail": "缺少凭据标识"}, 400)
+                return
+            pool = session.get("accounts", [])
+            user = session.get("activeUser", "")
+            acc = next((a for a in pool if a["user"] == user), None)
+            if not acc:
+                self._json({"error": 401, "detail": "未找到当前账户凭据"}, 401)
+                return
+            payload = {
+                "credentialId": cred_id,
+                "user": acc["user"],
+                "token": acc.get("token", ""),
+                "password": acc.get("password", ""),
+                "upstream": _upstream.cfg["upstream"],
+                "deviceName": dev_name,
+                "createdAt": int(time.time() * 1000),
+            }
+            cipher = obf_encode(json.dumps(payload))
+            self._json({
+                "error": 0,
+                "credentialId": cred_id,
+                "passkeyCipher": cipher,
+                "user": acc["user"],
+                "deviceName": dev_name,
+                "createdAt": payload["createdAt"],
+            })
+        elif req_path == "/api/passkey/login" and method == "POST":
+            try:
+                data = json.loads(raw.decode() or "{}")
+            except Exception:
+                self._json({"error": -1, "detail": "请求格式错误"}, 400)
+                return
+            cred_id = (data.get("credentialId") or "").strip()
+            cipher = (data.get("passkeyCipher") or "").strip()
+            if not cred_id or not cipher:
+                self._json({"error": -1, "detail": "通行密钥凭据不完整"}, 400)
+                return
+            try:
+                decrypted = obf_decode(cipher)
+                payload = json.loads(decrypted)
+            except Exception:
+                self._json({"error": 401, "detail": "通行密钥凭据已失效或损坏，请重新绑定"}, 401)
+                return
+            if payload.get("credentialId") != cred_id:
+                self._json({"error": 401, "detail": "凭据指纹不匹配"}, 401)
+                return
+            user = payload.get("user")
+            token = payload.get("token")
+            if not session:
+                sid = _session_mgr.new_session()
+                session = _session_mgr.get_session(sid)
+            else:
+                sid = self._get_session_id()
+            _session_mgr.add_account(sid, user, token, payload.get("password", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Set-Cookie", f"openp2p_session={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": 0, "user": user, "token": token, "sessionId": sid}).encode())
         elif req_path == "/api/login" and method == "POST":
             try:
                 data = json.loads(raw.decode() or "{}")
