@@ -1209,6 +1209,10 @@ a.tag { cursor: pointer; }
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
+.is-spinning {
+  animation: spin 0.8s linear infinite;
+  transform-origin: center;
+}
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ================= 下载中心 ================= */

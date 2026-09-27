@@ -48,28 +48,33 @@ async function pxp(path, opts = {}) {
   if (key) headers["X-Panel-Key"] = key;
   const sid = localStorage.getItem("panelSession");
   if (sid) headers["X-Session-Id"] = sid;
-  const rsp = await fetch(API + path, {
-    method: opts.method || "GET",
-    headers,
-    credentials: "same-origin",
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  const text = await rsp.text();
-  let data;
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
-  if (rsp.status === 401) {
-    if (data && data.detail && data.detail.includes("口令")) {
-      const key2 = prompt("本面板已启用访问口令，请输入：");
-      if (key2) {
-        localStorage.setItem("panelKey", key2);
+  try {
+    const rsp = await fetch(API + path, {
+      method: opts.method || "GET",
+      headers,
+      credentials: "same-origin",
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+    const text = await rsp.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    if (rsp.status === 401) {
+      if (data && data.detail && data.detail.includes("口令")) {
+        const key2 = prompt("本面板已启用访问口令，请输入：");
+        if (key2) {
+          localStorage.setItem("panelKey", key2);
+          location.reload();
+        }
+      } else {
+        localStorage.removeItem("panelSession");
         location.reload();
       }
-    } else {
-      localStorage.removeItem("panelSession");
-      location.reload();
     }
+    return { status: rsp.status, data };
+  } catch (err) {
+    console.error(`[pxp error] ${path}`, err);
+    return { status: 502, data: { error: -1, detail: String(err) } };
   }
-  return { status: rsp.status, data };
 }
 
 /** push 指令：默认 rsp=0（不阻塞等待回执），随后由调用方轮询确认 */
@@ -767,6 +772,12 @@ async function refreshAll(force = false) {
   if (!force && now - _lastRefreshAllTs < 1500) return;
   _lastRefreshAllTs = now;
   _refreshing = true;
+
+  const btn = $("btnRefreshAll");
+  const svg = btn ? btn.querySelector("svg") : null;
+  if (svg) svg.classList.add("is-spinning");
+  if (btn) btn.disabled = true;
+
   try {
     const [devs, sdw, prof] = await Promise.all([
       pxp("/api/v1/devices"),
@@ -793,6 +804,8 @@ async function refreshAll(force = false) {
     console.error("[refreshAll]", e);
     toast("网络错误: " + e, "err");
   } finally {
+    if (svg) svg.classList.remove("is-spinning");
+    if (btn) btn.disabled = false;
     _refreshing = false;
   }
 }
@@ -1430,7 +1443,7 @@ $("tlTable").addEventListener("click", async (ev) => {
   }
 });
 
-$("btnRefreshAll").addEventListener("click", () => refreshAll());
+$("btnRefreshAll").addEventListener("click", () => refreshAll(true));
 
 /* ---------------- 新建/编辑转发规则 ---------------- */
 function fillNodeSelects() {
