@@ -714,12 +714,7 @@ async function loginWithPasskey(targetCredId) {
     return;
   }
   const list = getPasskeyList();
-  if (!list.length) {
-    toast("当前设备尚未绑定任何通行密钥", "err");
-    return;
-  }
-  const entry = targetCredId ? list.find((p) => p.credentialId === targetCredId) : list[list.length - 1];
-  if (!entry) return;
+  const entry = targetCredId ? list.find((p) => p.credentialId === targetCredId) : (list.length ? list[list.length - 1] : null);
 
   const chalRsp = await fetch("/api/passkey/challenge").then((r) => r.json()).catch(() => null);
   if (!chalRsp || chalRsp.error !== 0) {
@@ -728,34 +723,37 @@ async function loginWithPasskey(targetCredId) {
   }
 
   const challengeBuf = base64UrlToBuffer(chalRsp.challenge);
-  const allowList = [
-    {
-      type: "public-key",
-      id: base64UrlToBuffer(entry.credentialId),
-    },
-  ];
+  const allowList = entry
+    ? [{ type: "public-key", id: base64UrlToBuffer(entry.credentialId) }]
+    : (list.length ? list.map((p) => ({ type: "public-key", id: base64UrlToBuffer(p.credentialId) })) : undefined);
 
   try {
-    toast("请验证设备的指纹、面容或安全密钥…");
-    const assertion = await navigator.credentials.get({
+    toast("请在弹出的 Bitwarden 或设备窗口中完成验证…");
+    const getOpts = {
       publicKey: {
         challenge: challengeBuf,
-        allowCredentials: allowList,
         userVerification: "preferred",
         timeout: 60000,
       },
-    });
+    };
+    if (allowList && allowList.length) {
+      getOpts.publicKey.allowCredentials = allowList;
+    }
+    const assertion = await navigator.credentials.get(getOpts);
 
     if (!assertion) return;
     toast("正在验证通行密钥并登入…");
+
+    const credId = bufferToBase64Url(assertion.rawId);
+    const matched = list.find((p) => p.credentialId === credId) || entry;
 
     const rsp = await fetch("/api/passkey/login", {
       method: "POST",
       headers: panelHeaders({ "Content-Type": "application/json" }),
       credentials: "same-origin",
       body: JSON.stringify({
-        credentialId: entry.credentialId,
-        passkeyCipher: entry.passkeyCipher,
+        credentialId: credId,
+        passkeyCipher: matched ? matched.passkeyCipher : "",
       }),
     });
     const data = await rsp.json();
@@ -789,10 +787,13 @@ function renderPasskeyLoginCards() {
     box.innerHTML = `
       <div class="passkey-empty">
         <div style="font-size:24px;margin-bottom:6px">🔑</div>
-        <b>当前设备尚未绑定通行密钥</b>
-        <p style="margin:4px 0 10px;font-size:12px">请先使用上方「账号密码登录」进入，在顶栏账户菜单中一键绑定当前设备（指纹/面容/Hello）。</p>
-        <button type="button" class="btn btn-sm" id="btnGoPasswordLogin">使用账号密码登录</button>
+        <b>当前设备未缓存通行密钥</b>
+        <p style="margin:4px 0 12px;font-size:12.5px;color:var(--muted)">若您已在 Bitwarden 密码库中保存过此站通行密钥，可直接调取：</p>
+        <button type="button" class="btn primary block" id="btnDiscoverPasskey" style="margin-bottom:10px">🔑 调取 Bitwarden / 已有通行密钥登录</button>
+        <button type="button" class="btn ghost btn-sm" id="btnGoPasswordLogin">使用账号密码登录</button>
       </div>`;
+    const btnDisc = $("btnDiscoverPasskey");
+    if (btnDisc) btnDisc.addEventListener("click", () => loginWithPasskey());
     const btnGo = $("btnGoPasswordLogin");
     if (btnGo) {
       btnGo.addEventListener("click", () => {
@@ -822,7 +823,7 @@ function renderPasskeyLoginCards() {
             <span class="tag" style="color:var(--accent);font-size:11px">通行密钥就绪</span>
           </div>
           <div class="passkey-card-meta">
-            ${esc(p.deviceName || "当前设备")} · 绑定于 ${esc(dateStr)}
+            ${esc(p.deviceName || "当前设备 / Bitwarden")} · 绑定于 ${esc(dateStr)}
           </div>
         </div>
         <div style="color:var(--accent);font-size:18px">${isSel ? "✓" : "○"}</div>
