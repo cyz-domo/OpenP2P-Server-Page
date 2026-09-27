@@ -819,8 +819,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Set-Cookie", f"openp2p_session={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": 0, "user": user, "token": token, "sessionId": sid}).encode())
+            self.wfile.write(json.dumps({
+                "error": 0,
+                "user": user,
+                "token": token,
+                "sessionId": sid,
+                "credentialId": cred_id,
+                "passkeyCipher": cipher,
+                "deviceName": payload.get("deviceName", "当前设备"),
+                "createdAt": payload.get("createdAt", int(time.time() * 1000))
+            }).encode())
         elif req_path == "/api/login" and method == "POST":
             try:
                 data = json.loads(raw.decode() or "{}")

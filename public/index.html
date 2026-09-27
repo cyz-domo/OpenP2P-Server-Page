@@ -6,7 +6,7 @@
 <title>OpenP2P 管理面板</title>
 <link rel="preconnect" href="https://console.openpxp.com" crossorigin>
 <link rel="dns-prefetch" href="https://console.openpxp.com">
-<link rel="stylesheet" href="app.css?v=20260916v">
+<link rel="stylesheet" href="app.css?v=20260917v">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%2310b981%22 stroke-width=%222%22><circle cx=%2212%22 cy=%225%22 r=%222.2%22/><circle cx=%225%22 cy=%2219%22 r=%222.2%22/><circle cx=%2219%22 cy=%2219%22 r=%222.2%22/><path d=%22M11 7l-5 10M13 7l5 10M7.2 19h9.6%22/></svg>">
 </head>
 <body>
@@ -88,11 +88,12 @@
         </div>
 
         <div id="modePasskey" class="hidden">
-          <div id="passkeyCardBox" class="passkey-card-box"></div>
-          <button type="button" id="btnPasskeyLogin" class="btn primary block btn-lg" style="margin-top:10px">
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" style="margin-right:6px"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M21 2l-9.6 9.6M15.5 7.5l2.5 2.5M18.5 4.5l2.5 2.5"/></svg>
-            <span>使用通行密钥登录</span>
-          </button>
+          <div class="passkey-login-box">
+            <button type="button" id="btnPasskeyLogin" class="btn primary block btn-lg">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" style="margin-right:8px"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M21 2l-9.6 9.6M15.5 7.5l2.5 2.5M18.5 4.5l2.5 2.5"/></svg>
+              <span>调取通行密钥快速登录</span>
+            </button>
+          </div>
         </div>
 
         <div id="modePassword">
@@ -716,6 +717,32 @@
   </form>
 </dialog>
 
+<!-- 通行密钥补全弹窗（无痕模式/跨端新设备） -->
+<dialog id="passkeySyncDialog">
+  <form id="pkSyncForm" method="dialog">
+    <div class="dlg-head">
+      <span class="dlg-icon">🔑</span>
+      <div>
+        <h3>验证成功！正在同步本地凭据</h3>
+        <p class="muted">检测到当前窗口为无痕模式或新环境。请输入一次密码或 Token 完成授权，之后即可无感免密。</p>
+      </div>
+    </div>
+    <div class="form-group">
+      <span class="label-text">已识别账号</span>
+      <input id="pkSyncUser" class="input" readonly style="opacity:0.85;background:var(--bg-card)">
+    </div>
+    <div class="form-group">
+      <span class="label-text">密码或官方 Token</span>
+      <input type="password" id="pkSyncSecret" class="input" placeholder="输入当前账号的密码或官方 Token" required autocomplete="current-password">
+    </div>
+    <div id="pkSyncErr" class="err hidden"></div>
+    <div class="dlg-actions">
+      <button type="button" class="btn ghost" id="pkSyncCancel">取消</button>
+      <button type="submit" class="btn primary" id="pkSyncSubmit">确认并登入</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- 确认弹窗 -->
 <dialog id="confirmDialog">
   <form method="dialog">
@@ -733,6 +760,6 @@
 <!-- 悬浮 Toast 消息 -->
 <div id="toast" class="hidden"></div>
 
-<script src="app.js?v=20260916v"></script>
+<script src="app.js?v=20260917v"></script>
 </body>
 </html>
