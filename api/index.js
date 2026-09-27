@@ -309,25 +309,35 @@ export default async function handler(request) {
     }
 
     const targetUrl = `${upstream}${subPath}${url.search}`;
-    const fwdHeaders = new Headers(request.headers);
-    fwdHeaders.delete("host");
-    fwdHeaders.delete("cookie");
+    const fwdHeaders = new Headers();
+    for (const [k, v] of request.headers.entries()) {
+      const lk = k.toLowerCase();
+      if (["host", "cookie", "connection", "accept-encoding", "content-length"].includes(lk)) continue;
+      fwdHeaders.set(k, v);
+    }
+    fwdHeaders.set("Host", new URL(upstream).host);
     if (token) fwdHeaders.set("Authorization", token);
 
     try {
-      // 纯流式直传 ReadableStream，长轮询与虚拟网络拓扑 0 延迟穿透
+      const reqBody = ["GET", "HEAD"].includes(method) ? undefined : await request.arrayBuffer();
       const upstreamRsp = await fetch(targetUrl, {
         method,
         headers: fwdHeaders,
-        body: ["GET", "HEAD"].includes(method) ? undefined : request.body,
+        body: reqBody,
         redirect: "follow",
       });
 
+      const respData = await upstreamRsp.arrayBuffer();
       const respHeaders = new Headers(upstreamRsp.headers);
+      respHeaders.delete("content-encoding");
+      respHeaders.delete("content-length");
+      respHeaders.delete("transfer-encoding");
+      respHeaders.delete("connection");
+      respHeaders.delete("keep-alive");
       respHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate");
       applySecurityHeaders(respHeaders);
 
-      return new Response(upstreamRsp.body, {
+      return new Response(respData, {
         status: upstreamRsp.status,
         headers: respHeaders,
       });
