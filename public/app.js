@@ -749,13 +749,54 @@ async function bindCurrentPasskey() {
   }
 }
 
+function promptSyncPasskeyDlg(userHint) {
+  return new Promise((resolve) => {
+    const dlg = $("passkeySyncDialog");
+    if (!dlg) {
+      const pass = prompt(`检测到当前窗口为无痕模式或新设备。\n请输入账号「${userHint}」的密码或 Token 授权：`);
+      resolve(pass ? pass.trim() : null);
+      return;
+    }
+    $("pkSyncUser").value = userHint || "已识别账号";
+    const secretInput = $("pkSyncSecret");
+    secretInput.value = "";
+    $("pkSyncErr").classList.add("hidden");
+
+    const onCancel = () => dlg.close("cancel");
+    $("pkSyncCancel").onclick = onCancel;
+    $("pkSyncForm").onsubmit = (ev) => {
+      ev.preventDefault();
+      const val = secretInput.value.trim();
+      if (!val) {
+        $("pkSyncErr").textContent = "请输入密码或官方 Token";
+        $("pkSyncErr").classList.remove("hidden");
+        return;
+      }
+      dlg.close("ok");
+    };
+
+    dlg.onclose = () => {
+      $("pkSyncCancel").onclick = null;
+      $("pkSyncForm").onsubmit = null;
+      if (dlg.returnValue === "ok") {
+        resolve(secretInput.value.trim());
+      } else {
+        resolve(null);
+      }
+    };
+
+    dlg.showModal();
+    setTimeout(() => secretInput.focus(), 50);
+  });
+}
+
 async function loginWithPasskey(targetCredId) {
   if (!isWebAuthnSupported()) {
     toast("当前环境不支持通行密钥", "err");
     return;
   }
   const list = getPasskeyList();
-  const entry = targetCredId ? list.find((p) => p.credentialId === targetCredId) : (list.length ? list[list.length - 1] : null);
+  const entry = targetCredId ? list.find((p) => p.credentialId === targetCredId) : null;
 
   const chalRsp = await fetch("/api/passkey/challenge").then((r) => r.json()).catch(() => null);
   if (!chalRsp || chalRsp.error !== 0) {
@@ -786,7 +827,79 @@ async function loginWithPasskey(targetCredId) {
     toast("正在验证通行密钥并登入…");
 
     const credId = bufferToBase64Url(assertion.rawId);
-    const matched = list.find((p) => p.credentialId === credId) || entry;
+    let matched = list.find((p) => p.credentialId === credId) || entry;
+    let passkeyCipher = matched ? matched.passkeyCipher : "";
+
+    // 解析 WebAuthn userHandle 获取用户名 (若有)
+    let parsedUser = matched ? matched.user : "";
+    if (!parsedUser && assertion.response && assertion.response.userHandle) {
+      try {
+        parsedUser = new TextDecoder().decode(assertion.response.userHandle);
+      } catch {}
+    }
+
+    // 若本地没有 passkeyCipher（例如在无痕模式或换了新设备）
+    if (!passkeyCipher) {
+      const userHint = parsedUser || (list.length === 1 ? list[0].user : "") || "OpenP2P 用户";
+      const inputSecret = await promptSyncPasskeyDlg(userHint);
+      if (!inputSecret) {
+        toast("已取消通行密钥登录");
+        return;
+      }
+      toast("正在校验凭据并同步至当前窗口…");
+      const isJwt = inputSecret.startsWith("eyJ") && inputSecret.includes(".");
+      const syncBody = isJwt
+        ? { token: inputSecret }
+        : { user: userHint, password: inputSecret };
+      syncBody.upstream = $("loginUpstream") ? $("loginUpstream").value.trim() : "";
+
+      const testRsp = await fetch(isJwt ? "/api/login-token" : "/api/login", {
+        method: "POST",
+        headers: panelHeaders({ "Content-Type": "application/json" }),
+        credentials: "same-origin",
+        body: JSON.stringify(syncBody),
+      }).then((r) => r.json()).catch(() => null);
+
+      if (!testRsp || testRsp.error !== 0) {
+        toast("凭据验证失败: " + (testRsp?.detail || "密码或 Token 错误"), "err");
+        return;
+      }
+
+      // 验证通过，自动为当前环境绑定该 credentialId 并生成 passkeyCipher
+      const bindRsp = await fetch("/api/passkey/bind", {
+        method: "POST",
+        headers: panelHeaders({ "Content-Type": "application/json" }),
+        credentials: "same-origin",
+        body: JSON.stringify({
+          credentialId: credId,
+          deviceName: detectDeviceLabel(),
+        }),
+      }).then((r) => r.json()).catch(() => null);
+
+      if (bindRsp && bindRsp.error === 0) {
+        passkeyCipher = bindRsp.passkeyCipher;
+        const curList = getPasskeyList().filter((p) => p.credentialId !== credId);
+        curList.push({
+          credentialId: credId,
+          passkeyCipher,
+          user: bindRsp.user,
+          deviceName: bindRsp.deviceName || detectDeviceLabel(),
+          createdAt: bindRsp.createdAt || Date.now(),
+        });
+        savePasskeyList(curList);
+        matched = curList[curList.length - 1];
+      }
+
+      if (testRsp.sessionId) localStorage.setItem("panelSession", testRsp.sessionId);
+      state.user = testRsp.user || userHint;
+      try {
+        const st = await (await fetch("/api/state", { headers: panelHeaders(), credentials: "same-origin" })).json();
+        state.accounts = st.accounts || [];
+      } catch {}
+      toast(`欢迎回来，${state.user}！已自动同步本设备通行密钥`, "ok");
+      enterMain();
+      return;
+    }
 
     const rsp = await fetch("/api/passkey/login", {
       method: "POST",
@@ -794,13 +907,21 @@ async function loginWithPasskey(targetCredId) {
       credentials: "same-origin",
       body: JSON.stringify({
         credentialId: credId,
-        passkeyCipher: matched ? matched.passkeyCipher : "",
+        passkeyCipher,
       }),
     });
     const data = await rsp.json();
     if (data.error === 0) {
       if (data.sessionId) localStorage.setItem("panelSession", data.sessionId);
       state.user = data.user;
+
+      // 如果返回了更新的 cipher，同步更新本地缓存
+      if (data.passkeyCipher && matched) {
+        matched.passkeyCipher = data.passkeyCipher;
+        const updatedList = getPasskeyList().map((p) => p.credentialId === credId ? { ...p, passkeyCipher: data.passkeyCipher } : p);
+        savePasskeyList(updatedList);
+      }
+
       try {
         const st = await (await fetch("/api/state", { headers: panelHeaders(), credentials: "same-origin" })).json();
         state.accounts = st.accounts || [];
@@ -822,62 +943,7 @@ async function loginWithPasskey(targetCredId) {
 }
 
 function renderPasskeyLoginCards() {
-  const box = $("passkeyCardBox");
-  if (!box) return;
-  const list = getPasskeyList();
-  if (!list.length) {
-    box.innerHTML = `
-      <div class="passkey-empty">
-        <div style="font-size:24px;margin-bottom:6px">🔑</div>
-        <b>当前设备未缓存通行密钥</b>
-        <p style="margin:4px 0 12px;font-size:12.5px;color:var(--muted)">若您已在 Bitwarden 密码库中保存过此站通行密钥，可直接调取：</p>
-        <button type="button" class="btn primary block" id="btnDiscoverPasskey" style="margin-bottom:10px">🔑 调取 Bitwarden / 已有通行密钥登录</button>
-        <button type="button" class="btn ghost btn-sm" id="btnGoPasswordLogin">使用账号密码登录</button>
-      </div>`;
-    const btnDisc = $("btnDiscoverPasskey");
-    if (btnDisc) btnDisc.addEventListener("click", () => loginWithPasskey());
-    const btnGo = $("btnGoPasswordLogin");
-    if (btnGo) {
-      btnGo.addEventListener("click", () => {
-        if ($("tabPassword")) $("tabPassword").click();
-      });
-    }
-    if ($("btnPasskeyLogin")) $("btnPasskeyLogin").classList.add("hidden");
-    return;
-  }
-
-  if ($("btnPasskeyLogin")) $("btnPasskeyLogin").classList.remove("hidden");
-  let selectedId = box.dataset.selectedId || list[list.length - 1].credentialId;
-  if (!list.some((p) => p.credentialId === selectedId)) {
-    selectedId = list[list.length - 1].credentialId;
-  }
-  box.dataset.selectedId = selectedId;
-
-  box.innerHTML = list.map((p) => {
-    const isSel = p.credentialId === selectedId;
-    const dateStr = p.createdAt ? new Date(p.createdAt).toLocaleDateString() : "本机";
-    return `
-      <div class="passkey-card ${isSel ? "selected" : ""}" data-cred-id="${esc(p.credentialId)}">
-        <div class="passkey-card-info">
-          <div class="passkey-card-user">
-            <span style="font-size:16px">👤</span>
-            <span>${esc(p.user)}</span>
-            <span class="tag" style="color:var(--accent);font-size:11px">通行密钥就绪</span>
-          </div>
-          <div class="passkey-card-meta">
-            🏷️ <b>${esc(p.deviceName || "未命名密钥")}</b> · 绑定于 ${esc(dateStr)}
-          </div>
-        </div>
-        <div style="color:var(--accent);font-size:18px">${isSel ? "✓" : "○"}</div>
-      </div>`;
-  }).join("");
-
-  box.querySelectorAll(".passkey-card").forEach((card) => {
-    card.addEventListener("click", () => {
-      box.dataset.selectedId = card.dataset.credId;
-      renderPasskeyLoginCards();
-    });
-  });
+  // 保持安全与极简：登录页不直接渲染账号名单，保护隐私
 }
 
 function renderPasskeyDialog() {
@@ -963,9 +1029,7 @@ if ($("passkeyClose")) $("passkeyClose").addEventListener("click", () => $("pass
 if ($("btnBindCurrentPasskey")) $("btnBindCurrentPasskey").addEventListener("click", () => bindCurrentPasskey());
 if ($("btnPasskeyLogin")) {
   $("btnPasskeyLogin").addEventListener("click", () => {
-    const box = $("passkeyCardBox");
-    const credId = box ? box.dataset.selectedId : "";
-    loginWithPasskey(credId);
+    loginWithPasskey();
   });
 }
 

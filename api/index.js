@@ -475,7 +475,15 @@ export default async function handler(request) {
       session.upstream = targetUpstream;
 
       const cookie = await createSessionCookie(session);
-      return jsonRsp({ error: 0, user: loginUser, token }, 200, { "Set-Cookie": cookie });
+      return jsonRsp({
+        error: 0,
+        user: loginUser,
+        token,
+        credentialId,
+        passkeyCipher,
+        deviceName: payload.deviceName || "当前设备",
+        createdAt: payload.createdAt || Date.now()
+      }, 200, { "Set-Cookie": cookie });
     }
 
     // 3. 登录 (支持密码与 Token 登录)
