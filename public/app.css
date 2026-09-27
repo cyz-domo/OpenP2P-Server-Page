@@ -532,6 +532,12 @@ body {
   flex-direction: column;
   gap: 12px;
 }
+.passkey-login-box {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 6px 0;
+}
 .passkey-card-box {
   display: flex;
   flex-direction: column;
