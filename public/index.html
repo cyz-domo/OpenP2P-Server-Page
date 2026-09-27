@@ -55,7 +55,7 @@
   <!-- 登录视图 -->
   <section id="loginView" class="login-wrap hidden">
     <div class="login-ambient"></div>
-    <form id="loginForm" class="login-card">
+    <div class="login-card">
       <div class="login-card-top">
         <button type="button" id="btnLoginTheme" class="btn ghost icon-btn" title="切换深色/浅色主题">🌙</button>
       </div>
@@ -76,56 +76,58 @@
               <button type="button" class="btn-link" data-upstream="https://console.openp2p.cn">国内镜像</button>
             </div>
           </div>
-          <input id="loginUpstream" class="input mono" placeholder="https://console.openpxp.com" value="https://console.openpxp.com" spellcheck="false">
+          <input type="url" id="loginUpstream" name="upstream_url" class="input mono" placeholder="https://console.openpxp.com" value="https://console.openpxp.com" autocomplete="off" data-bwignore="true" data-lpignore="true" data-form-type="other" spellcheck="false">
         </label>
       </div>
 
-      <div class="seg" role="tablist">
-        <button type="button" class="seg-btn active" data-mode="password">账号密码登录</button>
-        <button type="button" class="seg-btn" data-mode="token">官方 Token 登录</button>
-      </div>
-
-      <div id="modePassword">
-        <label class="form-group">
-          <span class="label-text">用户名 / 账号</span>
-          <input id="loginUser" class="input" autocomplete="username" placeholder="输入您的 OpenP2P 账号">
-        </label>
-        <label class="form-group">
-          <span class="label-text">密码</span>
-          <input id="loginPass" class="input" type="password" autocomplete="current-password" placeholder="输入密码">
-        </label>
-        <label class="chk">
-          <input id="loginRemember" type="checkbox" checked>
-          <span>记住密码（Token 过期后自动静默重登）</span>
-        </label>
-      </div>
-
-      <div id="modeToken" class="hidden">
-        <label class="form-group">
-          <span class="label-text">官方控制台 Token (JWT)</span>
-          <textarea id="loginToken" class="input mono" rows="3" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." spellcheck="false"></textarea>
-        </label>
-        <p class="field-hint">💡 提示：从控制台网页 localStorage 读取 <code>token</code> 变量即可，适合免密码直接绑定。</p>
-      </div>
-
-      <div class="captcha-row">
-        <label class="form-group">
-          <span class="label-text">图形验证码</span>
-          <input id="loginCaptcha" class="input captcha-input" maxlength="4" autocomplete="off" placeholder="输入数字">
-        </label>
-        <div id="captchaWrap" class="captcha-img-wrap" title="点击刷新验证码">
-          <img id="captchaImg" class="captcha-img" alt="验证码，点击刷新">
-          <span class="captcha-hint">刷新</span>
+      <form id="loginForm" class="login-form">
+        <div class="seg" role="tablist">
+          <button type="button" class="seg-btn active" data-mode="password">账号密码登录</button>
+          <button type="button" class="seg-btn" data-mode="token">官方 Token 登录</button>
         </div>
-      </div>
 
-      <div id="loginErr" class="err hidden"></div>
-      <button class="btn primary block btn-lg" type="submit">立即登录</button>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:2px">
-        <a href="javascript:" id="linkCancelLogin" class="hidden" style="color:var(--muted);font-size:12.5px">← 返回控制台</a>
-        <a href="javascript:" id="linkForgot" style="color:var(--muted);font-size:12.5px;margin-left:auto">忘记密码？</a>
-      </div>
-    </form>
+        <div id="modePassword">
+          <label class="form-group">
+            <span class="label-text">用户名 / 账号</span>
+            <input type="text" id="loginUser" name="username" class="input" autocomplete="username" placeholder="输入您的 OpenP2P 账号">
+          </label>
+          <label class="form-group">
+            <span class="label-text">密码</span>
+            <input type="password" id="loginPass" name="password" class="input" autocomplete="current-password" placeholder="输入密码">
+          </label>
+          <label class="chk">
+            <input id="loginRemember" type="checkbox" checked>
+            <span>记住密码（Token 过期后自动静默重登）</span>
+          </label>
+        </div>
+
+        <div id="modeToken" class="hidden">
+          <label class="form-group">
+            <span class="label-text">官方控制台 Token (JWT)</span>
+            <textarea id="loginToken" name="token" class="input mono" rows="3" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." autocomplete="off" data-bwignore="true" data-lpignore="true" spellcheck="false"></textarea>
+          </label>
+          <p class="field-hint">💡 提示：从控制台网页 localStorage 读取 <code>token</code> 变量即可，适合免密码直接绑定。</p>
+        </div>
+
+        <div class="captcha-row">
+          <label class="form-group">
+            <span class="label-text">图形验证码</span>
+            <input id="loginCaptcha" name="captcha" class="input captcha-input" maxlength="4" autocomplete="off" data-bwignore="true" data-lpignore="true" placeholder="输入数字">
+          </label>
+          <div id="captchaWrap" class="captcha-img-wrap" title="点击刷新验证码">
+            <img id="captchaImg" class="captcha-img" alt="验证码，点击刷新">
+            <span class="captcha-hint">刷新</span>
+          </div>
+        </div>
+
+        <div id="loginErr" class="err hidden"></div>
+        <button class="btn primary block btn-lg" type="submit">立即登录</button>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:2px">
+          <a href="javascript:" id="linkCancelLogin" class="hidden" style="color:var(--muted);font-size:12.5px">← 返回控制台</a>
+          <a href="javascript:" id="linkForgot" style="color:var(--muted);font-size:12.5px;margin-left:auto">忘记密码？</a>
+        </div>
+      </form>
+    </div>
   </section>
 
   <!-- 主视图 -->
@@ -645,21 +647,21 @@
     <div style="display:flex;gap:10px;align-items:flex-end">
       <label class="form-group" style="flex:1">
         <span class="label-text">注册邮箱</span>
-        <input id="rpEmail" class="input" type="email" placeholder="注册时填写的邮箱" required>
+        <input id="rpEmail" name="email" class="input" type="email" autocomplete="username email" placeholder="注册时填写的邮箱" required>
       </label>
       <button type="button" class="btn" id="rpSendCode" style="white-space:nowrap">发送验证码</button>
     </div>
     <label class="form-group">
       <span class="label-text">邮箱验证码</span>
-      <input id="rpCode" class="input" placeholder="邮件中的验证码" required>
+      <input id="rpCode" name="verification_code" class="input" autocomplete="off" data-bwignore="true" data-lpignore="true" placeholder="邮件中的验证码" required>
     </label>
     <label class="form-group">
       <span class="label-text">新密码（≥8 位）</span>
-      <input id="rpPass" class="input" type="password" minlength="8" required>
+      <input id="rpPass" name="new_password" class="input" type="password" autocomplete="new-password" minlength="8" required>
     </label>
     <label class="form-group">
       <span class="label-text">确认新密码</span>
-      <input id="rpPass2" class="input" type="password" minlength="8" required>
+      <input id="rpPass2" name="confirm_password" class="input" type="password" autocomplete="new-password" minlength="8" required>
     </label>
     <div id="resetErr" class="err hidden"></div>
     <div class="dlg-actions">

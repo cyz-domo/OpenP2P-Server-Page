@@ -378,6 +378,11 @@ body {
   position: relative;
   z-index: 1;
 }
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
 .login-card-top {
   position: absolute;
   top: 14px;
