@@ -586,22 +586,324 @@ async function reloadCaptcha() {
   }
 }
 
+/* ---------------- 通行密钥 (Passkey / WebAuthn) ---------------- */
+function isWebAuthnSupported() {
+  return window.isSecureContext && Boolean(window.PublicKeyCredential);
+}
+
+function bufferToBase64Url(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlToBuffer(b64url) {
+  let str = (b64url || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (str.length % 4) str += "=";
+  const binary = atob(str);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function getPasskeyList() {
+  try {
+    return JSON.parse(localStorage.getItem("openp2p_passkeys") || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function savePasskeyList(list) {
+  localStorage.setItem("openp2p_passkeys", JSON.stringify(list));
+}
+
+function detectDeviceLabel() {
+  const ua = navigator.userAgent;
+  if (/Macintosh/i.test(ua)) return "Mac (Touch ID / 本地密钥)";
+  if (/Windows/i.test(ua)) return "Windows (Hello / PIN)";
+  if (/iPhone|iPad/i.test(ua)) return "iOS (Face ID / Touch ID)";
+  if (/Android/i.test(ua)) return "Android (指纹 / 刷脸)";
+  if (/Linux/i.test(ua)) return "Linux (硬件安全密钥)";
+  return "当前设备通行密钥";
+}
+
+async function bindCurrentPasskey() {
+  if (!isWebAuthnSupported()) {
+    toast("当前环境不支持通行密钥 (WebAuthn)，需在 HTTPS 或 localhost 访问", "err");
+    return;
+  }
+  const chalRsp = await fetch("/api/passkey/challenge", { headers: panelHeaders() }).then((r) => r.json()).catch(() => null);
+  if (!chalRsp || chalRsp.error !== 0) {
+    toast("获取通行密钥挑战失败: " + (chalRsp?.detail || "网络超时"), "err");
+    return;
+  }
+  const challengeBuf = base64UrlToBuffer(chalRsp.challenge);
+  const userName = state.user || "OpenP2P 用户";
+  const userIdBuf = new TextEncoder().encode(userName);
+
+  try {
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        challenge: challengeBuf,
+        rp: {
+          name: "OpenP2P 管理控制台",
+          id: window.location.hostname,
+        },
+        user: {
+          id: userIdBuf,
+          name: userName,
+          displayName: userName,
+        },
+        pubKeyCredParams: [
+          { alg: -7, type: "public-key" },  // ES256
+          { alg: -257, type: "public-key" } // RS256
+        ],
+        authenticatorSelection: {
+          userVerification: "preferred",
+          residentKey: "preferred",
+        },
+        timeout: 60000,
+        attestation: "none",
+      },
+    });
+
+    if (!cred) return;
+    const credId = bufferToBase64Url(cred.rawId);
+    const devLabel = detectDeviceLabel();
+
+    const bindRsp = await fetch("/api/passkey/bind", {
+      method: "POST",
+      headers: panelHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        credentialId: credId,
+        deviceName: devLabel,
+      }),
+    }).then((r) => r.json());
+
+    if (bindRsp.error === 0) {
+      const list = getPasskeyList().filter((p) => p.credentialId !== credId && p.user !== bindRsp.user);
+      list.push({
+        credentialId: credId,
+        passkeyCipher: bindRsp.passkeyCipher,
+        user: bindRsp.user,
+        deviceName: devLabel,
+        createdAt: bindRsp.createdAt || Date.now(),
+      });
+      savePasskeyList(list);
+      toast(`已成功为账户「${bindRsp.user}」绑定当前设备通行密钥！`, "ok");
+      renderPasskeyDialog();
+      renderPasskeyLoginCards();
+    } else {
+      toast("绑定失败: " + (bindRsp.detail || "未知错误"), "err");
+    }
+  } catch (err) {
+    if (err.name === "NotAllowedError") {
+      toast("已取消通行密钥创建或验证超时");
+    } else {
+      console.error("[bindPasskey]", err);
+      toast("通行密钥创建失败: " + err.message, "err");
+    }
+  }
+}
+
+async function loginWithPasskey(targetCredId) {
+  if (!isWebAuthnSupported()) {
+    toast("当前环境不支持通行密钥", "err");
+    return;
+  }
+  const list = getPasskeyList();
+  if (!list.length) {
+    toast("当前设备尚未绑定任何通行密钥", "err");
+    return;
+  }
+  const entry = targetCredId ? list.find((p) => p.credentialId === targetCredId) : list[list.length - 1];
+  if (!entry) return;
+
+  const chalRsp = await fetch("/api/passkey/challenge").then((r) => r.json()).catch(() => null);
+  if (!chalRsp || chalRsp.error !== 0) {
+    toast("获取验证挑战失败", "err");
+    return;
+  }
+
+  const challengeBuf = base64UrlToBuffer(chalRsp.challenge);
+  const allowList = [
+    {
+      type: "public-key",
+      id: base64UrlToBuffer(entry.credentialId),
+    },
+  ];
+
+  try {
+    toast("请验证设备的指纹、面容或安全密钥…");
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge: challengeBuf,
+        allowCredentials: allowList,
+        userVerification: "preferred",
+        timeout: 60000,
+      },
+    });
+
+    if (!assertion) return;
+    toast("正在验证通行密钥并登入…");
+
+    const rsp = await fetch("/api/passkey/login", {
+      method: "POST",
+      headers: panelHeaders({ "Content-Type": "application/json" }),
+      credentials: "same-origin",
+      body: JSON.stringify({
+        credentialId: entry.credentialId,
+        passkeyCipher: entry.passkeyCipher,
+      }),
+    });
+    const data = await rsp.json();
+    if (data.error === 0) {
+      if (data.sessionId) localStorage.setItem("panelSession", data.sessionId);
+      state.user = data.user;
+      try {
+        const st = await (await fetch("/api/state", { headers: panelHeaders(), credentials: "same-origin" })).json();
+        state.accounts = st.accounts || [];
+      } catch {}
+      toast(`欢迎回来，${data.user}！已通过通行密钥免密登入`, "ok");
+      enterMain();
+    } else {
+      toast("通行密钥登录失败: " + (data.detail || "凭据错误"), "err");
+    }
+  } catch (err) {
+    if (err.name === "NotAllowedError") {
+      toast("已取消通行密钥验证");
+    } else {
+      console.error("[loginWithPasskey]", err);
+      toast("验证失败: " + err.message, "err");
+    }
+  }
+}
+
+function renderPasskeyLoginCards() {
+  const box = $("passkeyCardBox");
+  if (!box) return;
+  const list = getPasskeyList();
+  if (!list.length) {
+    box.innerHTML = `
+      <div class="passkey-empty">
+        <div style="font-size:24px;margin-bottom:6px">🔑</div>
+        <b>当前设备尚未绑定通行密钥</b>
+        <p style="margin:4px 0 10px;font-size:12px">请先使用上方「账号密码登录」进入，在顶栏账户菜单中一键绑定当前设备（指纹/面容/Hello）。</p>
+        <button type="button" class="btn btn-sm" id="btnGoPasswordLogin">使用账号密码登录</button>
+      </div>`;
+    const btnGo = $("btnGoPasswordLogin");
+    if (btnGo) {
+      btnGo.addEventListener("click", () => {
+        if ($("tabPassword")) $("tabPassword").click();
+      });
+    }
+    if ($("btnPasskeyLogin")) $("btnPasskeyLogin").classList.add("hidden");
+    return;
+  }
+
+  if ($("btnPasskeyLogin")) $("btnPasskeyLogin").classList.remove("hidden");
+  let selectedId = box.dataset.selectedId || list[list.length - 1].credentialId;
+  if (!list.some((p) => p.credentialId === selectedId)) {
+    selectedId = list[list.length - 1].credentialId;
+  }
+  box.dataset.selectedId = selectedId;
+
+  box.innerHTML = list.map((p) => {
+    const isSel = p.credentialId === selectedId;
+    const dateStr = p.createdAt ? new Date(p.createdAt).toLocaleDateString() : "本机";
+    return `
+      <div class="passkey-card ${isSel ? "selected" : ""}" data-cred-id="${esc(p.credentialId)}">
+        <div class="passkey-card-info">
+          <div class="passkey-card-user">
+            <span style="font-size:16px">👤</span>
+            <span>${esc(p.user)}</span>
+            <span class="tag" style="color:var(--accent);font-size:11px">通行密钥就绪</span>
+          </div>
+          <div class="passkey-card-meta">
+            ${esc(p.deviceName || "当前设备")} · 绑定于 ${esc(dateStr)}
+          </div>
+        </div>
+        <div style="color:var(--accent);font-size:18px">${isSel ? "✓" : "○"}</div>
+      </div>`;
+  }).join("");
+
+  box.querySelectorAll(".passkey-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      box.dataset.selectedId = card.dataset.credId;
+      renderPasskeyLoginCards();
+    });
+  });
+}
+
+function renderPasskeyDialog() {
+  const listEl = $("passkeyList");
+  if (!listEl) return;
+  const list = getPasskeyList();
+  if (!list.length) {
+    listEl.innerHTML = `<div class="passkey-empty">当前设备尚未绑定任何通行密钥</div>`;
+    return;
+  }
+  listEl.innerHTML = list.map((p) => {
+    const dateStr = p.createdAt ? new Date(p.createdAt).toLocaleString() : "本机";
+    return `
+      <div class="passkey-item">
+        <div class="passkey-item-info">
+          <div class="passkey-item-title">👤 ${esc(p.user)} · ${esc(p.deviceName || "当前设备")}</div>
+          <div class="passkey-item-sub">凭据标识: ${esc(p.credentialId.slice(0, 16))}... · 绑定于: ${esc(dateStr)}</div>
+        </div>
+        <button type="button" class="btn danger btn-sm btn-del-passkey" data-del-cred="${esc(p.credentialId)}">解绑</button>
+      </div>`;
+  }).join("");
+
+  listEl.querySelectorAll(".btn-del-passkey").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const cid = btn.dataset.delCred;
+      if (!(await confirmDlg("解除通行密钥绑定", "确认解绑该通行密钥？解绑后此设备无法再使用生物识别免密登录该账户。"))) return;
+      const updated = getPasskeyList().filter((p) => p.credentialId !== cid);
+      savePasskeyList(updated);
+      toast("已解绑该通行密钥");
+      renderPasskeyDialog();
+      renderPasskeyLoginCards();
+    });
+  });
+}
+
 document.querySelectorAll(".seg-btn").forEach((btn) =>
   btn.addEventListener("click", () => {
     loginMode = btn.dataset.mode;
     document.querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("active", b === btn));
     $("modePassword").classList.toggle("hidden", loginMode !== "password");
     $("modeToken").classList.toggle("hidden", loginMode !== "token");
+    if ($("modePasskey")) $("modePasskey").classList.toggle("hidden", loginMode !== "passkey");
+    const isPasskey = loginMode === "passkey";
+    if ($("loginCaptchaRow")) $("loginCaptchaRow").classList.toggle("hidden", isPasskey);
+    if ($("loginSubmitBtn")) $("loginSubmitBtn").classList.toggle("hidden", isPasskey);
     $("loginErr").classList.add("hidden");
-    reloadCaptcha();
+    if (isPasskey) {
+      renderPasskeyLoginCards();
+    } else {
+      reloadCaptcha();
+    }
   })
 );
 
 if ($("captchaWrap")) $("captchaWrap").addEventListener("click", reloadCaptcha);
 if ($("captchaImg")) $("captchaImg").addEventListener("click", reloadCaptcha);
+if ($("passkeyClose")) $("passkeyClose").addEventListener("click", () => $("passkeyDialog").close());
+if ($("btnBindCurrentPasskey")) $("btnBindCurrentPasskey").addEventListener("click", () => bindCurrentPasskey());
+if ($("btnPasskeyLogin")) {
+  $("btnPasskeyLogin").addEventListener("click", () => {
+    const box = $("passkeyCardBox");
+    const credId = box ? box.dataset.selectedId : "";
+    loginWithPasskey(credId);
+  });
+}
 
 $("loginForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
+  if (loginMode === "passkey") return;
   $("loginErr").classList.add("hidden");
   const captcha = $("loginCaptcha").value.trim();
   if (!captcha) {
@@ -674,6 +976,8 @@ function renderAcctMenu(accounts) {
     menu.innerHTML = `<div class="acct-empty">尚无账户</div>`;
     return;
   }
+  const passkeys = getPasskeyList();
+  const passkeyStatus = passkeys.some((p) => p.user === state.user) ? "（当前账号已绑）" : "";
   menu.innerHTML = accounts.map((a) => {
     const exp = a.tokenExp ? new Date(a.tokenExp * 1000).toLocaleDateString() : "无凭据";
     return `<button class="acct-item ${a.active ? "current" : ""}" data-user="${esc(a.user)}" data-active="${a.active ? 1 : 0}">
@@ -681,7 +985,10 @@ function renderAcctMenu(accounts) {
       <span class="meta">${a.hasToken ? "有效期至 " + exp : "未登录"}${a.hasPassword ? " · 密码✓" : ""}</span>
       ${a.active ? "" : '<span class="rm" data-rm="' + esc(a.user) + '" title="移除该账户">✕</span>'}
     </button>`;
-  }).join("") + `<div class="acct-sep"></div><button class="acct-add" data-add="1">＋ 添加账户</button>`;
+  }).join("") + `
+    <div class="acct-sep"></div>
+    <button type="button" class="acct-passkey" id="btnManagePasskey">🔑 设备通行密钥 ${esc(passkeyStatus)}</button>
+    <button class="acct-add" data-add="1">＋ 添加账户</button>`;
 }
 
 $("btnAcct").addEventListener("click", async () => {
@@ -700,6 +1007,13 @@ document.addEventListener("click", async (ev) => {
   const menu = $("acctMenu");
   if (!menu || menu.classList.contains("hidden")) return;
   // 点在菜单外则收起（菜单内部动作自行处理后再收起）
+  const passkeyBtn = ev.target.closest("#btnManagePasskey");
+  if (passkeyBtn) {
+    menu.classList.add("hidden");
+    renderPasskeyDialog();
+    $("passkeyDialog").showModal();
+    return;
+  }
   const rm = ev.target.closest(".rm[data-rm]");
   if (rm) {
     ev.stopPropagation();
@@ -730,7 +1044,8 @@ document.addEventListener("click", async (ev) => {
     $("loginView").classList.remove("hidden");
     $("linkCancelLogin").classList.remove("hidden");
     $("loginErr").classList.add("hidden");
-    await reloadCaptcha();
+    if ($("tabPassword")) $("tabPassword").click();
+    else await reloadCaptcha();
     return;
   }
   const item = ev.target.closest(".acct-item[data-user]");
@@ -2126,6 +2441,11 @@ document.querySelectorAll(".tab").forEach((t) =>
     if ($("linkCancelLogin")) $("linkCancelLogin").classList.add("hidden");
     $("connState").textContent = "未登录";
     if (state.user) $("loginUser").value = state.user;
-    await reloadCaptcha();
+    const pkeys = getPasskeyList();
+    if (pkeys.length && $("tabPasskey")) {
+      $("tabPasskey").click();
+    } else {
+      await reloadCaptcha();
+    }
   }
 })();

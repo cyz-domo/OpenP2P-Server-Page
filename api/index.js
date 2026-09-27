@@ -383,6 +383,101 @@ export default async function handler(request) {
       return jsonRsp({ captcha_id: cid, captchaId: cid, svg });
     }
 
+    // 2.1 通行密钥 (Passkey) - 获取 Challenge
+    if (pathname === "/api/passkey/challenge" && (method === "GET" || method === "POST")) {
+      const challengeBytes = new Uint8Array(32);
+      crypto.getRandomValues(challengeBytes);
+      return jsonRsp({ error: 0, challenge: base64UrlEncode(challengeBytes) });
+    }
+
+    // 2.2 通行密钥 (Passkey) - 绑定凭据 (需在登录态下执行)
+    if (pathname === "/api/passkey/bind" && method === "POST") {
+      const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+      if (!session.activeUser) {
+        return jsonRsp({ error: 401, detail: "请先登录后再绑定通行密钥" }, 401);
+      }
+      const acc = (session.accounts || []).find((a) => a.user === session.activeUser);
+      if (!acc) return jsonRsp({ error: 401, detail: "未找到当前账户凭据" }, 401);
+
+      let body;
+      try { body = await request.json(); } catch { return jsonRsp({ error: -1, detail: "参数错误" }, 400); }
+
+      const credentialId = (body.credentialId || "").trim();
+      const deviceName = (body.deviceName || "当前设备").trim();
+      if (!credentialId) return jsonRsp({ error: -1, detail: "缺少凭据标识" }, 400);
+
+      const passkeyPayload = {
+        credentialId,
+        user: acc.user,
+        token: acc.token,
+        password: acc.password || "",
+        upstream: session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM,
+        deviceName,
+        createdAt: Date.now()
+      };
+
+      const passkeyCipher = await encryptData(JSON.stringify(passkeyPayload), secret);
+      return jsonRsp({
+        error: 0,
+        credentialId,
+        passkeyCipher,
+        user: acc.user,
+        deviceName,
+        createdAt: passkeyPayload.createdAt
+      });
+    }
+
+    // 2.3 通行密钥 (Passkey) - 验证登录
+    if (pathname === "/api/passkey/login" && method === "POST") {
+      const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+      let body;
+      try { body = await request.json(); } catch { return jsonRsp({ error: -1, detail: "参数错误" }, 400); }
+
+      const credentialId = (body.credentialId || "").trim();
+      const passkeyCipher = (body.passkeyCipher || "").trim();
+      if (!credentialId || !passkeyCipher) {
+        return jsonRsp({ error: -1, detail: "通行密钥凭据不完整" }, 400);
+      }
+
+      const decryptedStr = await decryptData(passkeyCipher, secret);
+      if (!decryptedStr) {
+        return jsonRsp({ error: 401, detail: "通行密钥凭据已失效或损坏，请重新绑定" }, 401);
+      }
+
+      let payload;
+      try { payload = JSON.parse(decryptedStr); } catch { return jsonRsp({ error: -1, detail: "凭据解析失败" }, 400); }
+      if (payload.credentialId !== credentialId) {
+        return jsonRsp({ error: 401, detail: "凭据指纹不匹配" }, 401);
+      }
+
+      const loginUser = payload.user;
+      let token = payload.token;
+      const targetUpstream = payload.upstream || session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
+
+      if (!token || jwtExp(token) < Date.now() / 1000 + 60) {
+        if (payload.password) {
+          const r = await fetch(`${targetUpstream}/api/v1/user/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ user: loginUser, password: payload.password }),
+          }).catch(() => null);
+          if (r) {
+            const d = await r.json().catch(() => null);
+            if (d && d.error === 0 && d.token) token = d.token;
+          }
+        }
+      }
+
+      const pool = (session.accounts || []).filter((a) => a.user !== loginUser);
+      pool.push({ user: loginUser, token, password: payload.password || "" });
+      session.accounts = pool;
+      session.activeUser = loginUser;
+      session.upstream = targetUpstream;
+
+      const cookie = await createSessionCookie(session);
+      return jsonRsp({ error: 0, user: loginUser, token }, 200, { "Set-Cookie": cookie });
+    }
+
     // 3. 登录 (支持密码与 Token 登录)
     if ((pathname === "/api/login" || pathname === "/api/login-token") && method === "POST") {
       const secret = env.SESSION_SECRET || DEFAULT_SECRET;

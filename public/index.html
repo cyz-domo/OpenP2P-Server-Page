@@ -82,8 +82,17 @@
 
       <form id="loginForm" class="login-form">
         <div class="seg" role="tablist">
-          <button type="button" class="seg-btn active" data-mode="password">账号密码登录</button>
-          <button type="button" class="seg-btn" data-mode="token">官方 Token 登录</button>
+          <button type="button" class="seg-btn" id="tabPasskey" data-mode="passkey">🔑 通行密钥</button>
+          <button type="button" class="seg-btn active" id="tabPassword" data-mode="password">账号密码登录</button>
+          <button type="button" class="seg-btn" id="tabToken" data-mode="token">官方 Token 登录</button>
+        </div>
+
+        <div id="modePasskey" class="hidden">
+          <div id="passkeyCardBox" class="passkey-card-box"></div>
+          <button type="button" id="btnPasskeyLogin" class="btn primary block btn-lg" style="margin-top:10px">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" style="margin-right:6px"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M21 2l-9.6 9.6M15.5 7.5l2.5 2.5M18.5 4.5l2.5 2.5"/></svg>
+            <span>使用通行密钥登录</span>
+          </button>
         </div>
 
         <div id="modePassword">
@@ -109,7 +118,7 @@
           <p class="field-hint">💡 提示：从控制台网页 localStorage 读取 <code>token</code> 变量即可，适合免密码直接绑定。</p>
         </div>
 
-        <div class="captcha-row">
+        <div class="captcha-row" id="loginCaptchaRow">
           <label class="form-group">
             <span class="label-text">图形验证码</span>
             <input id="loginCaptcha" name="captcha" class="input captcha-input" maxlength="4" autocomplete="off" data-bwignore="true" data-lpignore="true" placeholder="输入数字">
@@ -121,7 +130,7 @@
         </div>
 
         <div id="loginErr" class="err hidden"></div>
-        <button class="btn primary block btn-lg" type="submit">立即登录</button>
+        <button class="btn primary block btn-lg" id="loginSubmitBtn" type="submit">立即登录</button>
         <div style="display:flex;justify-content:space-between;align-items:center;margin-top:2px">
           <a href="javascript:" id="linkCancelLogin" class="hidden" style="color:var(--muted);font-size:12.5px">← 返回控制台</a>
           <a href="javascript:" id="linkForgot" style="color:var(--muted);font-size:12.5px;margin-left:auto">忘记密码？</a>
@@ -635,6 +644,25 @@
     <div class="dlg-actions">
       <button type="button" class="btn ghost" id="setCancel">取消</button>
       <button type="submit" class="btn primary" id="setSave">保存设置</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 设备通行密钥 (Passkey) 管理弹窗 -->
+<dialog id="passkeyDialog">
+  <form id="passkeyForm" method="dialog">
+    <div class="dlg-head">
+      <span class="dlg-icon">🔑</span>
+      <div>
+        <h3>设备通行密钥 (Passkey)</h3>
+        <p class="muted">绑定本设备的生物识别（指纹 / 面容 / 硬件安全密钥），下次登录无需密码一键进入</p>
+      </div>
+    </div>
+    <div id="passkeyList" class="passkey-list"></div>
+    <div id="passkeyErr" class="err hidden"></div>
+    <div class="dlg-actions">
+      <button type="button" class="btn ghost" id="passkeyClose">关闭</button>
+      <button type="button" class="btn primary" id="btnBindCurrentPasskey">＋ 绑定当前设备通行密钥</button>
     </div>
   </form>
 </dialog>
