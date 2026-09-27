@@ -614,6 +614,12 @@ body {
   font-size: 13px;
   color: var(--text);
 }
+.passkey-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
 .passkey-item-sub {
   font-size: 11.5px;
   color: var(--muted);
