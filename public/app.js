@@ -137,6 +137,33 @@ function confirmDlg(title, msg) {
   });
 }
 
+function promptDlg(title, msg, defaultVal = "") {
+  return new Promise((resolve) => {
+    $("pmTitle").textContent = title;
+    $("pmMsg").textContent = msg;
+    const input = $("pmInput");
+    input.value = defaultVal || "";
+    const dlg = $("promptDialog");
+    const onCancel = () => {
+      dlg.close("cancel");
+    };
+    $("pmCancel").onclick = onCancel;
+    dlg.onclose = () => {
+      $("pmCancel").onclick = null;
+      if (dlg.returnValue === "ok") {
+        resolve(input.value.trim());
+      } else {
+        resolve(null);
+      }
+    };
+    dlg.showModal();
+    setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 50);
+  });
+}
+
 /* ================= SearchSelect 可搜索下拉组件 ================= */
 class SearchSelect {
   constructor(selectEl, options = {}) {
@@ -634,6 +661,20 @@ async function bindCurrentPasskey() {
     toast("当前环境不支持通行密钥 (WebAuthn)，需在 HTTPS 或 localhost 访问", "err");
     return;
   }
+
+  // 允许用户自定义备注名称（如“MacBook Pro”、“公司电脑”、“Bitwarden 密码库”等）
+  const defaultLabel = detectDeviceLabel();
+  const customName = await promptDlg(
+    "通行密钥名称备注",
+    "请为此通行密钥设置一个便于识别的备注名称（同一个账号可绑定多个不同名称的密钥）：",
+    defaultLabel
+  );
+  if (customName === null) {
+    // 用户取消
+    return;
+  }
+  const finalDevLabel = customName.trim() || defaultLabel;
+
   const chalRsp = await fetch("/api/passkey/challenge", { headers: panelHeaders() }).then((r) => r.json()).catch(() => null);
   if (!chalRsp || chalRsp.error !== 0) {
     toast("获取通行密钥挑战失败: " + (chalRsp?.detail || "网络超时"), "err");
@@ -654,7 +695,7 @@ async function bindCurrentPasskey() {
         user: {
           id: userIdBuf,
           name: userName,
-          displayName: userName,
+          displayName: `${userName} (${finalDevLabel})`,
         },
         pubKeyCredParams: [
           { alg: -7, type: "public-key" },  // ES256
@@ -671,28 +712,28 @@ async function bindCurrentPasskey() {
 
     if (!cred) return;
     const credId = bufferToBase64Url(cred.rawId);
-    const devLabel = detectDeviceLabel();
 
     const bindRsp = await fetch("/api/passkey/bind", {
       method: "POST",
       headers: panelHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         credentialId: credId,
-        deviceName: devLabel,
+        deviceName: finalDevLabel,
       }),
     }).then((r) => r.json());
 
     if (bindRsp.error === 0) {
-      const list = getPasskeyList().filter((p) => p.credentialId !== credId && p.user !== bindRsp.user);
+      // 关键：仅按 credentialId 去重，允许同一个用户添加多个不同通行密钥！
+      const list = getPasskeyList().filter((p) => p.credentialId !== credId);
       list.push({
         credentialId: credId,
         passkeyCipher: bindRsp.passkeyCipher,
         user: bindRsp.user,
-        deviceName: devLabel,
+        deviceName: finalDevLabel,
         createdAt: bindRsp.createdAt || Date.now(),
       });
       savePasskeyList(list);
-      toast(`已成功为账户「${bindRsp.user}」绑定当前设备通行密钥！`, "ok");
+      toast(`已成功为「${bindRsp.user}」添加通行密钥「${finalDevLabel}」！`, "ok");
       renderPasskeyDialog();
       renderPasskeyLoginCards();
     } else {
@@ -764,7 +805,8 @@ async function loginWithPasskey(targetCredId) {
         const st = await (await fetch("/api/state", { headers: panelHeaders(), credentials: "same-origin" })).json();
         state.accounts = st.accounts || [];
       } catch {}
-      toast(`欢迎回来，${data.user}！已通过通行密钥免密登入`, "ok");
+      const devTip = matched?.deviceName ? `（${matched.deviceName}）` : "";
+      toast(`欢迎回来，${data.user}${devTip}！已通过通行密钥免密登入`, "ok");
       enterMain();
     } else {
       toast("通行密钥登录失败: " + (data.detail || "凭据错误"), "err");
@@ -823,7 +865,7 @@ function renderPasskeyLoginCards() {
             <span class="tag" style="color:var(--accent);font-size:11px">通行密钥就绪</span>
           </div>
           <div class="passkey-card-meta">
-            ${esc(p.deviceName || "当前设备 / Bitwarden")} · 绑定于 ${esc(dateStr)}
+            🏷️ <b>${esc(p.deviceName || "未命名密钥")}</b> · 绑定于 ${esc(dateStr)}
           </div>
         </div>
         <div style="color:var(--accent);font-size:18px">${isSel ? "✓" : "○"}</div>
@@ -851,17 +893,42 @@ function renderPasskeyDialog() {
     return `
       <div class="passkey-item">
         <div class="passkey-item-info">
-          <div class="passkey-item-title">👤 ${esc(p.user)} · ${esc(p.deviceName || "当前设备")}</div>
-          <div class="passkey-item-sub">凭据标识: ${esc(p.credentialId.slice(0, 16))}... · 绑定于: ${esc(dateStr)}</div>
+          <div class="passkey-item-title">
+            <span>👤 ${esc(p.user)}</span>
+            <span style="color:var(--accent);margin:0 4px">·</span>
+            <span>🏷️ ${esc(p.deviceName || "未命名设备")}</span>
+          </div>
+          <div class="passkey-item-sub">凭据标识: ${esc(p.credentialId.slice(0, 16))}... · 绑定时间: ${esc(dateStr)}</div>
         </div>
-        <button type="button" class="btn danger btn-sm btn-del-passkey" data-del-cred="${esc(p.credentialId)}">解绑</button>
+        <div class="passkey-item-actions">
+          <button type="button" class="btn ghost btn-sm btn-rename-passkey" data-edit-cred="${esc(p.credentialId)}" title="修改备注名称">✏️ 改名</button>
+          <button type="button" class="btn danger btn-sm btn-del-passkey" data-del-cred="${esc(p.credentialId)}">解绑</button>
+        </div>
       </div>`;
   }).join("");
+
+  listEl.querySelectorAll(".btn-rename-passkey").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const cid = btn.dataset.editCred;
+      const target = getPasskeyList().find((p) => p.credentialId === cid);
+      if (!target) return;
+      const newName = await promptDlg("修改通行密钥备注", `修改通行密钥（账号：${target.user}）的备注名称：`, target.deviceName || "");
+      if (newName === null) return;
+      target.deviceName = newName.trim() || target.deviceName || "未命名密钥";
+      const updated = getPasskeyList().map((p) => p.credentialId === cid ? { ...p, deviceName: target.deviceName } : p);
+      savePasskeyList(updated);
+      toast("已更新通行密钥备注名称", "ok");
+      renderPasskeyDialog();
+      renderPasskeyLoginCards();
+    });
+  });
 
   listEl.querySelectorAll(".btn-del-passkey").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const cid = btn.dataset.delCred;
-      if (!(await confirmDlg("解除通行密钥绑定", "确认解绑该通行密钥？解绑后此设备无法再使用生物识别免密登录该账户。"))) return;
+      const target = getPasskeyList().find((p) => p.credentialId === cid);
+      const nameTip = target ? `「${target.deviceName || target.user}」` : "";
+      if (!(await confirmDlg("解除通行密钥绑定", `确认解绑通行密钥 ${nameTip}？解绑后此设备无法再使用此密钥免密登录该账户。`))) return;
       const updated = getPasskeyList().filter((p) => p.credentialId !== cid);
       savePasskeyList(updated);
       toast("已解绑该通行密钥");
