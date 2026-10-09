@@ -402,23 +402,39 @@ export default async function handler(request) {
 
     try {
       const reqBody = ["GET", "HEAD"].includes(method) ? undefined : await request.arrayBuffer();
-      const upstreamRsp = await fetch(targetUrl, {
-        method,
-        headers: fwdHeaders,
-        body: reqBody,
-        redirect: "manual",
-      });
+      let curUrl = targetUrl;
+      let upstreamRsp = null;
+      let redirectHops = 0;
 
-      // 严格检查 3xx 重定向，防止重定向逃逸至云元数据 (169.254.169.254) 或内部私网
-      if (upstreamRsp.status >= 300 && upstreamRsp.status < 400) {
-        const loc = upstreamRsp.headers.get("Location") || "";
-        try {
-          const locUrl = new URL(loc, targetUrl);
-          if (isPrivateHost(locUrl.hostname)) {
-            return jsonRsp({ error: 403, detail: "SSRF Blocked: 上游重定向至私有地址已被拦截" }, 403);
+      while (redirectHops < 5) {
+        const curMethod = redirectHops === 0 ? method : (upstreamRsp && [301, 302, 303].includes(upstreamRsp.status) ? "GET" : method);
+        const curBody = redirectHops === 0 ? reqBody : undefined;
+
+        upstreamRsp = await fetch(curUrl, {
+          method: curMethod,
+          headers: fwdHeaders,
+          body: curBody,
+          redirect: "manual",
+        });
+
+        // 检查 3xx 重定向：若合法则安全跟进，若指向私网/非HTTPS则拦截
+        if (upstreamRsp.status >= 300 && upstreamRsp.status < 400) {
+          const loc = upstreamRsp.headers.get("Location") || "";
+          if (!loc) break;
+          let nextUrl;
+          try {
+            nextUrl = new URL(loc, curUrl);
+          } catch {
+            return jsonRsp({ error: 400, detail: "上游重定向目标不合法" }, 400);
           }
-        } catch {
-          return jsonRsp({ error: 400, detail: "上游重定向目标不合法" }, 400);
+          if (nextUrl.protocol !== "https:" || isPrivateHost(nextUrl.hostname)) {
+            return jsonRsp({ error: 403, detail: "SSRF Blocked: 上游重定向至私有或非安全地址已被拦截" }, 403);
+          }
+          curUrl = nextUrl.toString();
+          fwdHeaders.set("Host", nextUrl.host);
+          redirectHops++;
+        } else {
+          break;
         }
       }
 

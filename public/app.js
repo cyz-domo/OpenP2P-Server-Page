@@ -1283,7 +1283,7 @@ async function refreshAll(force = false) {
   try {
     const [devs, sdw, prof] = await Promise.all([
       pxp("/api/v1/devices"),
-      pxp("/api/v1/sdwans/"),
+      pxp("/api/v1/sdwans"),
       pxp("/api/v1/user/profile", { method: "POST", body: {} }),
     ]);
     if (devs.status === 200 && devs.data.nodes) {
@@ -2474,7 +2474,7 @@ $("btnNetSave").addEventListener("click", async () => {
     const rsp = await pxp("/api/v1/sdwan/edit", { method: "POST", body: s });
     if (rsp.status === 200) {
       // 回读服务端配置，确认子网代理等变更真实生效
-      const verify = await pxp("/api/v1/sdwans/");
+      const verify = await pxp("/api/v1/sdwans");
       const saved = verify.status === 200 && verify.data.Nodes ? verify.data : null;
       const savedRes = saved ? saved.Nodes.map((n) => `${n.name}:${n.resource || "∅"}`).join(" ") : "";
       const localRes = s.Nodes.map((n) => `${n.name}:${n.resource || "∅"}`).join(" ");
