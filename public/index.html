@@ -257,6 +257,7 @@
           <select id="tlStateFilter" class="input sel" title="按在线/连接状态筛选">
             <option value="all">全部连接状态</option>
             <option value="ok">🟢 仅看已连接</option>
+            <option value="err">⚠️ 驱动/连接异常</option>
             <option value="wait">⏳ 连接中 / 重试中</option>
             <option value="peeroff">⚪ 对端离线 / 等待中</option>
             <option value="off">🚫 仅看已停用</option>
@@ -268,6 +269,7 @@
         </div>
         <div class="spacer"></div>
         <span id="tlSummary" class="counter-badge">共 0 条</span>
+        <button id="btnTlRefreshNode" class="btn" title="仅重新采集当前所选设备的隧道状态">⟳ 刷新本节点</button>
         <button id="btnAddRule" class="btn primary">＋ 新建转发规则</button>
       </div>
 
@@ -365,8 +367,10 @@
         <div class="table-wrap">
           <table class="tbl" id="netTable">
             <thead><tr>
-              <th>节点设备名</th><th>分配虚拟 IP</th><th>公网 IP</th>
-              <th>在线状态</th><th>隧道连接状态</th><th>子网代理 (Resource)</th><th class="th-op">操作</th>
+              <th class="sortable" data-sort="name">节点设备名 <span class="sort-arrow"></span></th>
+              <th>分配虚拟 IP</th><th>公网 IP</th>
+              <th class="sortable" data-sort="online">在线状态 <span class="sort-arrow"></span></th>
+              <th>隧道连接状态</th><th>子网代理 (Resource)</th><th class="th-op">操作</th>
             </tr></thead>
             <tbody></tbody>
           </table>
@@ -386,7 +390,11 @@
           <div class="table-wrap">
             <table class="tbl" id="memTable">
               <thead><tr>
-                <th>本端节点</th><th>对端节点</th><th>链路模式</th><th>中继节点</th><th>连接状态</th><th>最后连接时间</th>
+                <th>本端节点</th>
+                <th class="sortable" data-sort="peer">对端节点 <span class="sort-arrow"></span></th>
+                <th>链路模式</th><th>中继节点</th>
+                <th class="sortable" data-sort="state">连接状态 <span class="sort-arrow"></span></th>
+                <th>最后连接时间</th>
               </tr></thead>
               <tbody></tbody>
             </table>
