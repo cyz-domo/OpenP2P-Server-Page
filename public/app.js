@@ -47,6 +47,10 @@ function isDriverError(errStr) {
   return /wintun|tun|tap|driver|adapter|驱动|网卡/i.test(errStr || "");
 }
 
+function isPeerOffline(errStr) {
+  return /peer\s*(is\s*)?(off|offline|closed|not\s*online)|target\s*offline|对端离线|对方离线/i.test(errStr || "");
+}
+
 /* ---------------- 基础工具 ---------------- */
 function toast(msg, type = "") {
   const el = $("toast");
@@ -1813,7 +1817,7 @@ function renderTunnels() {
   const connStateOf = (a, node) => {
     if (!isEnabled(a, node)) return { txt: "已停用", cls: "cs-off", key: "off" };
     const err = extractTunnelError(a);
-    if (err) {
+    if (err && !isPeerOffline(err)) {
       const isDriver = isDriverError(err);
       return {
         txt: isDriver ? `⚠️ 驱动异常: ${esc(err)}` : `❌ 异常: ${esc(err)}`,
@@ -1826,7 +1830,7 @@ function renderTunnels() {
     const rawTime = a.connectTime || a.ConnectTime || a.lastConnectTime || a.activeTime;
     const never = !rawTime || String(rawTime).startsWith(ZERO_TIME) || String(rawTime).startsWith("1970-01-01");
     const peerDev = devMap[a.peerNode];
-    if (peerDev && !onlineDev(peerDev)) return { txt: "等待对端上线", cls: "cs-wait", key: "peeroff" };
+    if (isPeerOffline(err) || (peerDev && !onlineDev(peerDev))) return { txt: "⚪ 对端离线", cls: "cs-wait", key: "peeroff", tip: err || "等待对端设备上线" };
     if (never) return { txt: "正在连接…", cls: "cs-wait", key: "wait" };
     return { txt: "重试中", cls: "cs-wait", key: "wait" };
   };
@@ -2264,14 +2268,17 @@ function renderNetwork() {
     const apps = memApps[name];
     if (!apps) return { txt: "点击「刷新状态」拉取", cls: "dim" };
     if (!apps.length) return { txt: "· 无隧道", cls: "dim" };
-    const errApps = apps.filter((a) => extractTunnelError(a));
+    const realErrApps = apps.filter((a) => {
+      const e = extractTunnelError(a);
+      return e && !isPeerOffline(e);
+    });
     const active = apps.filter((a) => a.isActive === 1).length;
-    if (errApps.length > 0) {
-      const isDriver = errApps.some((a) => isDriverError(extractTunnelError(a)));
+    if (realErrApps.length > 0) {
+      const isDriver = realErrApps.some((a) => isDriverError(extractTunnelError(a)));
       return {
-        txt: isDriver ? `⚠️ 驱动异常 (${errApps.length}/${apps.length})` : `⚠️ 异常 (${errApps.length}/${apps.length})`,
+        txt: isDriver ? `⚠️ 驱动异常 (${realErrApps.length}/${apps.length})` : `⚠️ 异常 (${realErrApps.length}/${apps.length})`,
         cls: "cs-err",
-        tip: errApps.map((a) => `${a.peerNode}: ${extractTunnelError(a)}`).join("\n")
+        tip: realErrApps.map((a) => `${a.peerNode}: ${extractTunnelError(a)}`).join("\n")
       };
     }
     return active > 0
@@ -2566,10 +2573,10 @@ function renderMemApps() {
   } else if (memSort.key === "state") {
     const stateVal = (a) => {
       const err = extractTunnelError(a);
-      if (err) return 0;
+      if (err && !isPeerOffline(err)) return 0;
       if (a.isActive === 1) return 1;
       const peerDev = devMap[a.peerNode];
-      if (peerDev && !onlineDev(peerDev)) return 3;
+      if (isPeerOffline(err) || (peerDev && !onlineDev(peerDev))) return 3;
       if (a.enabled === 0) return 4;
       return 2;
     };
@@ -2593,15 +2600,15 @@ function renderMemApps() {
     const timeHtml = timeFormatted ? esc(timeFormatted) : (a.isActive ? `<span class="muted" title="长连接持续活跃中（客户端未产生重连时间戳）">持续活跃中</span>` : `<span class="muted">-</span>`);
     const err = extractTunnelError(a);
     let stHtml;
-    if (err) {
+    if (err && !isPeerOffline(err)) {
       const isDriver = isDriverError(err);
       stHtml = `<span class="cs-err" title="${esc(err)}">⚠️ ${isDriver ? "驱动异常" : "异常"}: ${esc(err)}</span>`;
     } else if (a.isActive) {
       stHtml = `<span class="cs-ok">✅ 活跃</span>`;
     } else if (a.enabled === 0) {
       stHtml = `<span class="cs-off">⏸ 停用</span>`;
-    } else if (peerDev && !isPeerOnline) {
-      stHtml = `<span class="cs-wait">⚪ 对端离线</span>`;
+    } else if (isPeerOffline(err) || (peerDev && !isPeerOnline)) {
+      stHtml = `<span class="cs-wait" title="${err ? esc(err) : '对端设备离线'}">⚪ 对端离线</span>`;
     } else {
       stHtml = `<span class="cs-wait">· 未连接</span>`;
     }
