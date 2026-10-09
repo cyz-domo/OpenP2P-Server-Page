@@ -704,8 +704,25 @@ export default async function handler(request) {
       const acc = (session.accounts || []).find((a) => a.user === targetUser);
       if (!acc) return jsonRsp({ error: -1, detail: "未找到该账户" }, 404);
       session.activeUser = targetUser;
+
+      // 如果目标账户 Token 已过期或缺失，且存有密码，立即重登刷新 Token
+      const targetUpstream = session.upstream || env.UPSTREAM_URL || DEFAULT_UPSTREAM;
+      if (acc.password && (!acc.token || jwtExp(acc.token) < Date.now() / 1000 + 60)) {
+        try {
+          const r = await fetch(`${targetUpstream}/api/v1/user/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ user: acc.user, password: acc.password }),
+          });
+          const d = await r.json();
+          if (d && d.error === 0 && d.token) {
+            acc.token = d.token;
+          }
+        } catch {}
+      }
+
       const cookie = await createSessionCookie(session);
-      return jsonRsp({ error: 0, user: targetUser }, 200, { "Set-Cookie": cookie });
+      return jsonRsp({ error: 0, user: targetUser, token: acc.token }, 200, { "Set-Cookie": cookie });
     }
 
     // 6. 移除账户
