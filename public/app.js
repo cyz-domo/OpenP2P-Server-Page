@@ -619,6 +619,8 @@ async function checkState() {
     const st = await rsp.json();
     state.accounts = st.accounts || [];
     state.upstream = st.upstream || "https://console.openpxp.com";
+    state.hasCustomSecret = st.hasCustomSecret !== false;
+    state.insecureSsl = Boolean(st.insecureSsl);
     if ($("loginUpstream")) $("loginUpstream").value = state.upstream;
     if ($("setCurUpstream")) $("setCurUpstream").value = state.upstream;
     if (st.hasToken && (!st.tokenExp || st.tokenExp * 1000 > Date.now())) {
@@ -1804,7 +1806,7 @@ function renderTunnels() {
     if (err) {
       const isDriver = isDriverError(err);
       return {
-        txt: isDriver ? `⚠️ 驱动异常: ${err}` : `❌ 异常: ${err}`,
+        txt: isDriver ? `⚠️ 驱动异常: ${esc(err)}` : `❌ 异常: ${esc(err)}`,
         cls: "cs-err",
         key: "err",
         tip: err
@@ -2804,6 +2806,22 @@ if ($("linkCancelLogin")) {
 $("btnSettings").addEventListener("click", () => {
   $("settingsErr").classList.add("hidden");
   if ($("setCurUpstream")) $("setCurUpstream").value = state.upstream || "https://console.openpxp.com";
+  const warnEl = $("settingsSecWarn");
+  if (warnEl) {
+    const warns = [];
+    if (state.hasCustomSecret === false) {
+      warns.push("⚠️ 尚未配置 SESSION_SECRET 环境变量：当前系统运行于实例临时强随机密钥，实例重启后已有会话需重新登录。建议在部署环境变量中配置固定 SESSION_SECRET。");
+    }
+    if (state.insecureSsl) {
+      warns.push("⚠️ 服务端已启用 --insecure-ssl：跳过了上游 SSL/TLS 证书校验，存在中间人攻击窃听风险！");
+    }
+    if (warns.length) {
+      warnEl.textContent = warns.join("\n");
+      warnEl.classList.remove("hidden");
+    } else {
+      warnEl.classList.add("hidden");
+    }
+  }
   $("settingsDialog").showModal();
 });
 

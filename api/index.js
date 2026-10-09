@@ -10,7 +10,21 @@ export const config = {
 const DEFAULT_UPSTREAM = "https://console.openpxp.com";
 const SESSION_COOKIE_NAME = "openp2p_session";
 const SESSION_TTL = 30 * 24 * 3600; // 30天
-const DEFAULT_SECRET = "openp2p-vercel-aes-secret-key-32bytes-v2";
+
+/* ---------------- 运行时密钥管理 ---------------- */
+let _runtimeEphemeralSecret = null;
+
+function getSessionSecret(env) {
+  const custom = env && typeof env.SESSION_SECRET === "string" ? env.SESSION_SECRET.trim() : "";
+  if (custom) return custom;
+  if (!_runtimeEphemeralSecret) {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    _runtimeEphemeralSecret = base64UrlEncode(bytes);
+    console.warn("[SECURITY NOTICE] 未配置 SESSION_SECRET 环境变量，系统已自动生成 256 位实例内存强随机密钥。建议在部署环境变量中配置固定 SESSION_SECRET。");
+  }
+  return _runtimeEphemeralSecret;
+}
 
 /* ---------------- 基础工具与 Base64 ---------------- */
 function base64UrlEncode(strOrBuffer) {
@@ -42,7 +56,7 @@ let _cachedAesKey = null;
 let _cachedAesSecret = null;
 
 async function getDerivedAesKey(secret) {
-  const currentSecret = secret || DEFAULT_SECRET;
+  const currentSecret = secret || getSessionSecret(getEnv());
   if (_cachedAesKey && _cachedAesSecret === currentSecret) {
     return _cachedAesKey;
   }
@@ -88,7 +102,7 @@ let _cachedHmacKey = null;
 let _cachedHmacSecret = null;
 
 async function getHmacKey(secret) {
-  const currentSecret = secret || DEFAULT_SECRET;
+  const currentSecret = secret || getSessionSecret(getEnv());
   if (_cachedHmacKey && _cachedHmacSecret === currentSecret) {
     return _cachedHmacKey;
   }
@@ -126,16 +140,45 @@ async function verifyData(signedStr, secret) {
 /* ---------------- SSRF 内网拦截 ---------------- */
 function isPrivateHost(hostname) {
   if (!hostname) return true;
-  hostname = hostname.toLowerCase().trim();
-  if (hostname === "localhost" || hostname.endsWith(".local") || hostname.endsWith(".internal")) return true;
+  hostname = hostname.replace(/^\[|\]$/g, "").toLowerCase().trim();
+  if (
+    hostname === "localhost" ||
+    hostname === "ip6-localhost" ||
+    hostname === "ip6-loopback" ||
+    hostname === "instance-data" ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal")
+  ) {
+    return true;
+  }
+  // 处理 IPv4 映射的 IPv6 (::ffff:127.0.0.1 等)
+  if (hostname.startsWith("::ffff:")) {
+    hostname = hostname.slice(7);
+  }
   const parts = hostname.split(".");
   if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) {
     const [a, b, c, d] = parts.map(Number);
-    if (a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 0 || a >= 224) {
+    if (
+      a === 0 ||
+      a === 10 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      a >= 224
+    ) {
       return true;
     }
   }
-  if (hostname === "::1" || hostname.startsWith("fe80:") || hostname.startsWith("fc00:") || hostname.startsWith("fd00:")) return true;
+  if (
+    hostname === "::1" ||
+    hostname.startsWith("fe80:") ||
+    hostname.startsWith("fc00:") ||
+    hostname.startsWith("fd00:")
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -211,7 +254,7 @@ function getEnv() {
 
 async function getSession(request) {
   const env = getEnv();
-  const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+  const secret = getSessionSecret(env);
   const cookieHeader = request.headers.get("Cookie") || "";
   const cookies = parseCookies(cookieHeader);
   const rawCookie = cookies[SESSION_COOKIE_NAME] || request.headers.get("X-Session-Id");
@@ -234,7 +277,7 @@ async function getSession(request) {
 
 async function createSessionCookie(sessionData) {
   const env = getEnv();
-  const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+  const secret = getSessionSecret(env);
   const encrypted = await encryptData(JSON.stringify(sessionData), secret);
   return `${SESSION_COOKIE_NAME}=${encodeURIComponent(encrypted)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; SameSite=Lax; Secure`;
 }
@@ -324,8 +367,21 @@ export default async function handler(request) {
         method,
         headers: fwdHeaders,
         body: reqBody,
-        redirect: "follow",
+        redirect: "manual",
       });
+
+      // 严格检查 3xx 重定向，防止重定向逃逸至云元数据 (169.254.169.254) 或内部私网
+      if (upstreamRsp.status >= 300 && upstreamRsp.status < 400) {
+        const loc = upstreamRsp.headers.get("Location") || "";
+        try {
+          const locUrl = new URL(loc, targetUrl);
+          if (isPrivateHost(locUrl.hostname)) {
+            return jsonRsp({ error: 403, detail: "SSRF Blocked: 上游重定向至私有地址已被拦截" }, 403);
+          }
+        } catch {
+          return jsonRsp({ error: 400, detail: "上游重定向目标不合法" }, 400);
+        }
+      }
 
       const respData = await upstreamRsp.arrayBuffer();
       const respHeaders = new Headers(upstreamRsp.headers);
@@ -362,6 +418,8 @@ export default async function handler(request) {
         user,
         hasToken: Boolean(token),
         tokenExp: token ? jwtExp(token) : 0,
+        hasCustomSecret: Boolean((env.SESSION_SECRET || "").trim()),
+        insecureSsl: false,
         accounts: pool.map((a) => ({
           user: a.user,
           hasToken: Boolean(a.token),
@@ -374,7 +432,7 @@ export default async function handler(request) {
 
     // 2. 验证码接口 (2分钟窗口 + 随机 Nonce)
     if (pathname === "/api/captcha" && (method === "GET" || method === "POST")) {
-      const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+      const secret = getSessionSecret(env);
       const theme = url.searchParams.get("theme") || request.headers.get("X-Panel-Theme") || "dark";
       const code = Math.floor(1000 + Math.random() * 9000).toString();
       const nonce = Math.random().toString(36).slice(2, 8);
@@ -392,7 +450,7 @@ export default async function handler(request) {
 
     // 2.2 通行密钥 (Passkey) - 绑定凭据 (需在登录态下执行)
     if (pathname === "/api/passkey/bind" && method === "POST") {
-      const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+      const secret = getSessionSecret(env);
       if (!session.activeUser) {
         return jsonRsp({ error: 401, detail: "请先登录后再绑定通行密钥" }, 401);
       }
@@ -429,7 +487,7 @@ export default async function handler(request) {
 
     // 2.3 通行密钥 (Passkey) - 验证登录
     if (pathname === "/api/passkey/login" && method === "POST") {
-      const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+      const secret = getSessionSecret(env);
       let body;
       try { body = await request.json(); } catch { return jsonRsp({ error: -1, detail: "参数错误" }, 400); }
 
@@ -488,7 +546,7 @@ export default async function handler(request) {
 
     // 3. 登录 (支持密码与 Token 登录)
     if ((pathname === "/api/login" || pathname === "/api/login-token") && method === "POST") {
-      const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+      const secret = getSessionSecret(env);
       let body;
       try {
         body = await request.json();
