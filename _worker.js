@@ -8,18 +8,24 @@ const SESSION_COOKIE_NAME = "openp2p_session";
 const SESSION_TTL = 30 * 24 * 3600; // 30天
 
 /* ---------------- 运行时密钥管理 ---------------- */
-let _runtimeEphemeralSecret = null;
+const DEFAULT_SECRET = "openp2p-cloudflare-aes-secret-key-32bytes-v2";
+const LEGACY_FALLBACK_SECRETS = [
+  "openp2p-cloudflare-aes-secret-key-32bytes-v2",
+  "openp2p-vercel-aes-secret-key-32bytes-v2",
+  "openp2p-edgeone-aes-secret-key-32bytes-v2",
+  "openp2p-default-aes-secret-key-32bytes",
+  "openp2p-default-aes-secret-key-32bytes-v2"
+];
 
+let _hasWarnedSecret = false;
 function getSessionSecret(env) {
   const custom = env && typeof env.SESSION_SECRET === "string" ? env.SESSION_SECRET.trim() : "";
   if (custom) return custom;
-  if (!_runtimeEphemeralSecret) {
-    const bytes = new Uint8Array(32);
-    crypto.getRandomValues(bytes);
-    _runtimeEphemeralSecret = base64UrlEncode(bytes);
-    console.warn("[SECURITY NOTICE] 未配置 SESSION_SECRET 环境变量，系统已自动生成 256 位实例内存强随机密钥。建议在部署环境变量中配置固定 SESSION_SECRET。");
+  if (!_hasWarnedSecret) {
+    _hasWarnedSecret = true;
+    console.warn("[SECURITY NOTICE] 未配置 SESSION_SECRET 环境变量，当前使用平台默认会话密钥。建议在部署环境变量中配置固定 SESSION_SECRET。");
   }
-  return _runtimeEphemeralSecret;
+  return DEFAULT_SECRET;
 }
 
 /* ---------------- 基础工具与 Base64 ---------------- */
@@ -47,30 +53,31 @@ function base64UrlDecode(str) {
   return new TextDecoder().decode(base64UrlDecodeBytes(str));
 }
 
-/* ---------------- AES-GCM-256 加密存储与 HMAC 签名 (带内存 Key 单例缓存) ---------------- */
-let _cachedAesKey = null;
-let _cachedAesSecret = null;
+/* ---------------- AES-GCM-256 加密存储与 HMAC 签名 (带内存 Key Map 缓存与平滑回退) ---------------- */
+const _cachedAesKeys = new Map();
 
-async function getDerivedAesKey(secret) {
-  const currentSecret = secret || getSessionSecret();
-  if (_cachedAesKey && _cachedAesSecret === currentSecret) {
-    return _cachedAesKey;
+async function getDerivedAesKey(secret, env) {
+  const currentSecret = secret || getSessionSecret(env);
+  if (_cachedAesKeys.has(currentSecret)) {
+    return _cachedAesKeys.get(currentSecret);
   }
   const enc = new TextEncoder();
   const baseKey = await crypto.subtle.importKey("raw", enc.encode(currentSecret), "PBKDF2", false, ["deriveKey"]);
-  _cachedAesKey = await crypto.subtle.deriveKey(
+  const derived = await crypto.subtle.deriveKey(
     { name: "PBKDF2", salt: enc.encode("openp2p-salt-2026"), iterations: 10000, hash: "SHA-256" },
     baseKey,
     { name: "AES-GCM", length: 256 },
     false,
     ["encrypt", "decrypt"]
   );
-  _cachedAesSecret = currentSecret;
-  return _cachedAesKey;
+  if (_cachedAesKeys.size > 20) _cachedAesKeys.clear();
+  _cachedAesKeys.set(currentSecret, derived);
+  return derived;
 }
 
-async function encryptData(plainText, secret) {
-  const key = await getDerivedAesKey(secret);
+async function encryptData(plainText, secret, env) {
+  const currentSecret = secret || getSessionSecret(env);
+  const key = await getDerivedAesKey(currentSecret, env);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plainText));
   const combined = new Uint8Array(iv.byteLength + encrypted.byteLength);
@@ -79,13 +86,13 @@ async function encryptData(plainText, secret) {
   return base64UrlEncode(combined);
 }
 
-async function decryptData(cipherB64, secret) {
+async function decryptWithSecret(cipherB64, secret, env) {
   try {
     const raw = base64UrlDecodeBytes(cipherB64);
     if (raw.byteLength <= 12) return null;
     const iv = raw.slice(0, 12);
     const data = raw.slice(12);
-    const key = await getDerivedAesKey(secret);
+    const key = await getDerivedAesKey(secret, env);
     const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
     return new TextDecoder().decode(decrypted);
   } catch {
@@ -93,43 +100,75 @@ async function decryptData(cipherB64, secret) {
   }
 }
 
-let _cachedHmacKey = null;
-let _cachedHmacSecret = null;
+async function decryptDataWithMeta(cipherB64, secret, env) {
+  const currentSecret = secret || getSessionSecret(env);
+  const primary = await decryptWithSecret(cipherB64, currentSecret, env);
+  if (primary !== null) return { text: primary, isLegacy: false };
 
-async function getHmacKey(secret) {
-  const currentSecret = secret || getSessionSecret();
-  if (_cachedHmacKey && _cachedHmacSecret === currentSecret) {
-    return _cachedHmacKey;
+  for (const legacy of LEGACY_FALLBACK_SECRETS) {
+    if (legacy === currentSecret) continue;
+    const fallback = await decryptWithSecret(cipherB64, legacy, env);
+    if (fallback !== null) return { text: fallback, isLegacy: true };
   }
-  _cachedHmacKey = await crypto.subtle.importKey(
+  return { text: null, isLegacy: false };
+}
+
+async function decryptData(cipherB64, secret, env) {
+  const meta = await decryptDataWithMeta(cipherB64, secret, env);
+  return meta.text;
+}
+
+const _cachedHmacKeys = new Map();
+
+async function getHmacKey(secret, env) {
+  const currentSecret = secret || getSessionSecret(env);
+  if (_cachedHmacKeys.has(currentSecret)) {
+    return _cachedHmacKeys.get(currentSecret);
+  }
+  const derived = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(currentSecret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign", "verify"]
   );
-  _cachedHmacSecret = currentSecret;
-  return _cachedHmacKey;
+  if (_cachedHmacKeys.size > 20) _cachedHmacKeys.clear();
+  _cachedHmacKeys.set(currentSecret, derived);
+  return derived;
 }
 
-async function signData(dataStr, secret) {
-  const key = await getHmacKey(secret);
+async function signData(dataStr, secret, env) {
+  const currentSecret = secret || getSessionSecret(env);
+  const key = await getHmacKey(currentSecret, env);
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(dataStr));
   return `${base64UrlEncode(dataStr)}.${base64UrlEncode(signature)}`;
 }
 
-async function verifyData(signedStr, secret) {
+async function verifyData(signedStr, secret, env) {
   if (!signedStr || !signedStr.includes(".")) return null;
+  const currentSecret = secret || getSessionSecret(env);
   const [b64Data, b64Sig] = signedStr.split(".");
-  try {
-    const rawData = base64UrlDecode(b64Data);
-    const key = await getHmacKey(secret);
-    const sigBytes = base64UrlDecodeBytes(b64Sig);
-    const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(rawData));
-    return valid ? rawData : null;
-  } catch {
-    return null;
+  const tryVerify = async (sec) => {
+    try {
+      const rawData = base64UrlDecode(b64Data);
+      const key = await getHmacKey(sec, env);
+      const sigBytes = base64UrlDecodeBytes(b64Sig);
+      const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(rawData));
+      return valid ? rawData : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const primary = await tryVerify(currentSecret);
+  if (primary !== null) return primary;
+
+  for (const legacy of LEGACY_FALLBACK_SECRETS) {
+    if (legacy === currentSecret) continue;
+    const fallback = await tryVerify(legacy);
+    if (fallback !== null) return fallback;
   }
+  return null;
 }
 
 /* ---------------- SSRF 内网地址检测 ---------------- */
@@ -482,13 +521,13 @@ export default {
           return jsonRsp({ error: -1, detail: "通行密钥凭据不完整" }, 400);
         }
 
-        const decryptedStr = await decryptData(passkeyCipher, secret);
-        if (!decryptedStr) {
+        const meta = await decryptDataWithMeta(passkeyCipher, secret, env);
+        if (!meta.text) {
           return jsonRsp({ error: 401, detail: "通行密钥凭据已失效或损坏，请重新绑定" }, 401);
         }
 
         let payload;
-        try { payload = JSON.parse(decryptedStr); } catch { return jsonRsp({ error: -1, detail: "凭据解析失败" }, 400); }
+        try { payload = JSON.parse(meta.text); } catch { return jsonRsp({ error: -1, detail: "凭据解析失败" }, 400); }
         if (payload.credentialId !== credentialId) {
           return jsonRsp({ error: 401, detail: "凭据指纹不匹配" }, 401);
         }
@@ -517,13 +556,23 @@ export default {
         session.activeUser = loginUser;
         session.upstream = targetUpstream;
 
+        // 若使用历史密钥解密成功，或 Token 发生了刷新，使用当前密钥重新加密生成新凭据下发给客户端无感升级
+        let updatedCipher = passkeyCipher;
+        if (meta.isLegacy || (token && token !== payload.token)) {
+          try {
+            payload.token = token || payload.token;
+            payload.upstream = targetUpstream;
+            updatedCipher = await encryptData(JSON.stringify(payload), secret, env);
+          } catch {}
+        }
+
         const cookie = await createSessionCookie(session, env);
         return jsonRsp({
           error: 0,
           user: loginUser,
           token,
           credentialId,
-          passkeyCipher,
+          passkeyCipher: updatedCipher,
           deviceName: payload.deviceName || "当前设备",
           createdAt: payload.createdAt || Date.now()
         }, 200, { "Set-Cookie": cookie });
