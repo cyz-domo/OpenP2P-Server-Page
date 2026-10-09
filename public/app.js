@@ -1214,11 +1214,22 @@ document.addEventListener("click", async (ev) => {
     if (rsp.error === 0) {
       toast(`已移除 ${user}`);
       menu.classList.add("hidden");
-      const st = await (await fetch("/api/state", { headers: panelHeaders() })).json();
+      const st = await (await fetch("/api/state", { headers: panelHeaders(), credentials: "same-origin" })).json();
       if (st.hasToken) {
         state.user = st.user;
         $("userInfo").textContent = st.user;
-        await refreshAll();
+        state.devices = [];
+        state.sdwan = null;
+        state.profile = null;
+        state.tunnelByNode = {};
+        state.memByNode = {};
+        state.memApps = [];
+        _lastRefreshAllTs = 0;
+        _lastRefreshTunnelsTs = 0;
+        _tunnelsCacheTs = 0;
+        state.accounts = st.accounts || [];
+        renderAcctMenu(state.accounts);
+        await refreshAll(true);
       } else {
         location.reload();
       }
@@ -1241,22 +1252,58 @@ document.addEventListener("click", async (ev) => {
   }
   const item = ev.target.closest(".acct-item[data-user]");
   if (item && item.dataset.active !== "1") {
-    const rsp = await pxp2("/api/accounts/switch", { user: item.dataset.user });
-    if (rsp.error === 0) {
-      menu.classList.add("hidden");
-      toast(`已切换到 ${rsp.user}`, "ok");
-      state.user = rsp.user;
-      $("userInfo").textContent = rsp.user;
-      await refreshAll();
-    } else {
-      toast(rsp.detail || "切换失败", "err");
-    }
+    menu.classList.add("hidden");
+    await doSwitchAccount(item.dataset.user);
     return;
   }
   // 点击菜单空白处不关闭
   if (ev.target.closest(".acct-menu")) return;
   if (!ev.target.closest(".acct-wrap")) menu.classList.add("hidden");
 });
+
+async function doSwitchAccount(targetUser) {
+  try {
+    toast(`正在切换至账户「${targetUser}」…`);
+    const rsp = await pxp2("/api/accounts/switch", { user: targetUser });
+    if (rsp.error !== 0) {
+      toast(rsp.detail || "切换失败", "err");
+      return;
+    }
+
+    state.user = rsp.user;
+    $("userInfo").textContent = rsp.user;
+
+    // 清空前一个账户的设备、SD-WAN虚拟组网与隧道缓存，避免跨账户数据污染
+    state.devices = [];
+    state.sdwan = null;
+    state.profile = null;
+    state.tunnelByNode = {};
+    state.memByNode = {};
+    state.memApps = [];
+    _lastRefreshAllTs = 0;
+    _lastRefreshTunnelsTs = 0;
+    _tunnelsCacheTs = 0;
+
+    // 重置跨设备筛选框
+    if ($("tlNodeFilter")) $("tlNodeFilter").value = "";
+    if ($("tlSearch")) $("tlSearch").value = "";
+    if ($("devSearch")) $("devSearch").value = "";
+    if (memSelSS) memSelSS.setValue("");
+
+    // 重新获取服务端会话状态更新账户列表及勾选高亮
+    try {
+      const st = await (await fetch("/api/state", { headers: panelHeaders(), credentials: "same-origin" })).json();
+      state.accounts = st.accounts || [];
+      renderAcctMenu(state.accounts);
+    } catch {}
+
+    toast(`已切换至「${rsp.user}」，正在拉取数据…`, "ok");
+    await refreshAll(true);
+  } catch (err) {
+    console.error("[doSwitchAccount]", err);
+    toast("切换账户异常: " + (err.message || err), "err");
+  }
+}
 
 async function pxp2(path, body) {
   const rsp = await fetch(path, {
@@ -1273,7 +1320,7 @@ let _refreshing = false; // 防并发：refreshAll 重入会交错重绘 DOM 导
 let _lastRefreshAllTs = 0;
 
 async function refreshAll(force = false) {
-  if (_refreshing) return;
+  if (_refreshing && !force) return;
   const now = Date.now();
   if (!force && now - _lastRefreshAllTs < 1500) return;
   _lastRefreshAllTs = now;
@@ -1304,7 +1351,7 @@ async function refreshAll(force = false) {
 
     // 优化：按需加载。在非隧道/网络页时避免向所有在线节点突发下发推送指令
     if (state.selView === "tunnels" || state.selView === "networks" || force) {
-      await refreshTunnels(true);
+      await refreshTunnels(true, force);
     }
   } catch (e) {
     console.error("[refreshAll]", e);
@@ -1367,8 +1414,8 @@ async function refreshTunnels(quiet = false, force = false) {
     if (state.selView === "networks") renderNetwork();
     return;
   }
-  if (_refreshingTunnels) return;
-  if (now - _lastRefreshTunnelsTs < 1500 && quiet) return;
+  if (_refreshingTunnels && !force) return;
+  if (!force && now - _lastRefreshTunnelsTs < 1500 && quiet) return;
   _lastRefreshTunnelsTs = now;
   _refreshingTunnels = true;
 
