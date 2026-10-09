@@ -6,6 +6,8 @@ const API = "/api/pxp"; // 反向代理前缀 (统一走 /api/ 路由以适配 V
 
 /* ---------------- 状态 ---------------- */
 const tunnelSort = { key: "state", dir: 1 }; // 隧道表排序（默认按连接状态，已连接在前）
+const netSort = { key: "", dir: 1 }; // 网络成员表排序（节点设备名或在线状态）
+const memSort = { key: "online", dir: 1 }; // 成员透视表排序（默认在线状态优先）
 let tlSub = "pf"; // 隧道子视图：pf=端口转发 sd=虚拟组网
 const state = {
   devices: [],
@@ -22,6 +24,28 @@ const state = {
   disabledApps: new Set(), // 本会话内停用过的规则 key（设备停用后上报不再带 enabled 字段）
   selView: "devices",
 };
+
+/** 提取隧道可能上报的报错或驱动异常信息 */
+function extractTunnelError(a) {
+  if (!a) return "";
+  const candidates = [
+    a.errMsg, a.ErrMsg, a.error, a.Error, a.err, a.Err,
+    a.reason, a.Reason, a.errorMsg, a.ErrorMsg,
+    a.detail, a.msg, a.Msg, a.statusMsg
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c.trim();
+    if (typeof c === "number" && c !== 0) return `错误码 ${c}`;
+  }
+  if (typeof a.status === "string" && /err|fail|crash|fault/i.test(a.status)) {
+    return a.status.trim();
+  }
+  return "";
+}
+
+function isDriverError(errStr) {
+  return /wintun|tun|tap|driver|adapter|驱动|网卡/i.test(errStr || "");
+}
 
 /* ---------------- 基础工具 ---------------- */
 function toast(msg, type = "") {
@@ -48,13 +72,20 @@ async function pxp(path, opts = {}) {
   if (key) headers["X-Panel-Key"] = key;
   const sid = localStorage.getItem("panelSession");
   if (sid) headers["X-Session-Id"] = sid;
+
+  const timeoutMs = opts.timeout ?? 15000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     const rsp = await fetch(API + path, {
       method: opts.method || "GET",
       headers,
       credentials: "same-origin",
       body: opts.body ? JSON.stringify(opts.body) : undefined,
+      signal: controller.signal,
     });
+    clearTimeout(timer);
     const text = await rsp.text();
     let data;
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
@@ -72,15 +103,21 @@ async function pxp(path, opts = {}) {
     }
     return { status: rsp.status, data };
   } catch (err) {
+    clearTimeout(timer);
+    const isTimeout = err.name === "AbortError";
     console.error(`[pxp error] ${path}`, err);
-    return { status: 502, data: { error: -1, detail: String(err) } };
+    return { status: isTimeout ? 504 : 502, data: { error: -1, detail: isTimeout ? "请求超时（设备或上游未在限制时间内返回）" : String(err) } };
   }
 }
 
-/** push 指令：默认 rsp=0（不阻塞等待回执），随后由调用方轮询确认 */
-function pushCmd(node, subtype, body, rsp = 0) {
+/** push 指令：默认 rsp=0（不阻塞等待回执），随后由调用方轮询确认；rsp=1 时支持超时限制 */
+function pushCmd(node, subtype, body, rsp = 0, timeout = 12000) {
   const q = `subtype=${subtype}&rsp=${rsp}&edgeserver=`;
-  return pxp(`/api/v1/device/${encodeURIComponent(node)}/push?${q}`, { method: "POST", body: body || {} });
+  return pxp(`/api/v1/device/${encodeURIComponent(node)}/push?${q}`, {
+    method: "POST",
+    body: body || {},
+    timeout: rsp ? timeout : 5000
+  });
 }
 
 function fmtTime(s, fallback = "-") {
@@ -532,7 +569,13 @@ function initSearchSelects() {
     tlNodeFilterSS = new SearchSelect($("tlNodeFilter"), {
       placeholder: "全部设备",
       searchPlaceholder: "检索设备以筛选…",
-      onChange: () => renderTunnels()
+      onChange: (val) => {
+        renderTunnels();
+        const selected = val || (tlNodeFilterSS ? tlNodeFilterSS.getValue() : $("tlNodeFilter").value);
+        if (selected && (!state.tunnelByNode[selected] || state.tunnelByNode[selected].length === 0)) {
+          fetchSingleNodeTunnels(selected, true);
+        }
+      }
     });
   }
   if ($("ruNode") && !ruNodeSS) {
@@ -1257,7 +1300,43 @@ async function refreshAll(force = false) {
   }
 }
 
-/** 并发受限拉取所有在线设备的规则列表（最大并发3，配合 15s SWR 缓存大幅减负源站）。
+/** 单节点隧道按需即时采集（选择具体节点时快速响应，500ms~1s 出结果，不被全量阻塞） */
+async function fetchSingleNodeTunnels(nodeName, quiet = false) {
+  if (!nodeName) return;
+  const dev = state.devices.find((d) => d.name === nodeName);
+  if (!dev || !onlineDev(dev)) {
+    if (!quiet) toast(`${nodeName} 离线，无法读取隧道状态`, "err");
+    return;
+  }
+  if (!quiet) toast(`正在采集 ${nodeName} 的隧道状态…`);
+  try {
+    const [r7, r17] = await Promise.all([
+      pushCmd(nodeName, 7, {}, 1, 10000),
+      pushCmd(nodeName, 17, {}, 1, 10000),
+    ]);
+    const apps7 = (r7.status === 200 && Array.isArray(r7.data?.Apps)) ? r7.data.Apps.filter((a) => a.srcPort) : [];
+    const apps17 = (r17.status === 200 && Array.isArray(r17.data?.Apps)) ? r17.data.Apps : [];
+    if (r17.status === 200 && Array.isArray(r17.data?.Apps)) {
+      state.memByNode[nodeName] = apps17;
+    }
+    const combined = [...apps7];
+    const existing = new Set(combined.map((a) => a.peerNode + "|" + (a.appName || "")));
+    for (const a of apps17) {
+      const k = a.peerNode + "|" + (a.appName || "");
+      if (!existing.has(k)) combined.push(a);
+    }
+    state.tunnelByNode[nodeName] = combined;
+    _tunnelsCacheTs = Date.now();
+    renderTunnels();
+    if (state.selView === "networks") renderNetwork();
+    if (!quiet) toast(`已更新 ${nodeName} 的隧道规则（共 ${combined.length} 条）`, "ok");
+  } catch (err) {
+    console.error(`[fetchSingleNodeTunnels] ${nodeName}`, err);
+    if (!quiet) toast(`采集 ${nodeName} 隧道状态失败`, "err");
+  }
+}
+
+/** 并发受限拉取所有在线设备的规则列表（渐进式逐台渲染，带 10s 超时保护防队列挂死，15s SWR 缓存）。
  *  端口转发来自 subtype=7（本机发起的隧道应用）；
  *  组网隧道全拓扑来自 subtype=17（成员视角，含未活跃对端）——两者合并去重，并同步填充成员状态缓存。 */
 let _refreshingTunnels = false;
@@ -1287,36 +1366,39 @@ async function refreshTunnels(quiet = false, force = false) {
     }
     if (!quiet) toast(`正在拉取 ${online.length} 台在线设备的规则…`);
 
-    // 限制同时最多 3 个长轮询连接，大幅降低源站并发突发压力
-    const [r7, r17] = await Promise.all([
-      runBatchLimit(online.map((d) => () => pushCmd(d.name, 7, {}, 1)), 3),
-      runBatchLimit(online.map((d) => () => pushCmd(d.name, 17, {}, 1)), 3),
-    ]);
-
-    const map = {};
-    for (const d of state.devices) map[d.name] = map[d.name] || [];
-    const put = (i, arr) => { map[online[i].name] = arr; };
-    const get = (resArr, i) => (resArr[i] && resArr[i].status === "fulfilled"
-      && resArr[i].value.status === 200 && Array.isArray(resArr[i].value.data.Apps))
-      ? resArr[i].value.data.Apps : null;
-
-    for (let i = 0; i < online.length; i++) {
-      const apps = get(r7, i);
-      if (apps) put(i, apps.filter((a) => a.srcPort));
+    state.tunnelByNode = state.tunnelByNode || {};
+    for (const d of state.devices) {
+      if (!state.tunnelByNode[d.name]) state.tunnelByNode[d.name] = [];
     }
 
-    for (let i = 0; i < online.length; i++) {
-      const mem = get(r17, i);
-      if (!mem) continue;
-      state.memByNode[online[i].name] = mem;
-      const existing = new Set(map[online[i].name].map((a) => a.peerNode + "|" + (a.appName || "")));
-      for (const a of mem) {
-        const k = a.peerNode + "|" + (a.appName || "");
-        if (!existing.has(k)) map[online[i].name].push(a);
+    // 渐进式逐台拉取：每台设备同时拉取 7 和 17（超时 10s），每完成一台立即更新缓存并刷新界面
+    const tasks = online.map((d) => async () => {
+      try {
+        const [r7, r17] = await Promise.all([
+          pushCmd(d.name, 7, {}, 1, 10000),
+          pushCmd(d.name, 17, {}, 1, 10000),
+        ]);
+        const apps7 = (r7.status === 200 && Array.isArray(r7.data?.Apps)) ? r7.data.Apps.filter((a) => a.srcPort) : [];
+        const apps17 = (r17.status === 200 && Array.isArray(r17.data?.Apps)) ? r17.data.Apps : [];
+        if (r17.status === 200 && Array.isArray(r17.data?.Apps)) {
+          state.memByNode[d.name] = apps17;
+        }
+        const combined = [...apps7];
+        const existing = new Set(combined.map((a) => a.peerNode + "|" + (a.appName || "")));
+        for (const a of apps17) {
+          const k = a.peerNode + "|" + (a.appName || "");
+          if (!existing.has(k)) combined.push(a);
+        }
+        state.tunnelByNode[d.name] = combined;
+        // 渐进式局部更新，多设备时不需要等待全部完成才出结果
+        if (state.selView === "tunnels") renderTunnels();
+        if (state.selView === "networks") renderNetwork();
+      } catch (err) {
+        console.warn(`[refreshTunnels] 跳过异常设备 ${d.name}:`, err);
       }
-    }
+    });
 
-    state.tunnelByNode = map;
+    await runBatchLimit(tasks, 3);
     _tunnelsCacheTs = Date.now();
     renderTunnels();
     if (state.selView === "networks") renderNetwork();
@@ -1690,6 +1772,16 @@ function renderTunnels() {
   };
   const connStateOf = (a, node) => {
     if (!isEnabled(a, node)) return { txt: "已停用", cls: "cs-off", key: "off" };
+    const err = extractTunnelError(a);
+    if (err) {
+      const isDriver = isDriverError(err);
+      return {
+        txt: isDriver ? `⚠️ 驱动异常: ${err}` : `❌ 异常: ${err}`,
+        cls: "cs-err",
+        key: "err",
+        tip: err
+      };
+    }
     if (a.isActive === 1) return { txt: "✅ 已连接", cls: "cs-ok", key: "ok" };
     const rawTime = a.connectTime || a.ConnectTime || a.lastConnectTime || a.activeTime;
     const never = !rawTime || String(rawTime).startsWith(ZERO_TIME) || String(rawTime).startsWith("1970-01-01");
@@ -1713,8 +1805,8 @@ function renderTunnels() {
     }
   }
 
-  // 排序：peer=对端字母序；state=连接状态优先级（已连接 > 连接中 > 等待对端 > 停用）
-  const stateOrder = { ok: 0, wait: 1, peeroff: 2, off: 3 };
+  // 排序：peer=对端字母序；state=连接状态优先级（异常 > 已连接 > 连接中 > 等待对端 > 停用）
+  const stateOrder = { err: 0, ok: 1, wait: 2, peeroff: 3, off: 4 };
   if (tunnelSort.key === "peer") {
     rows.sort((x, y) => (x.a.peerNode || "").localeCompare(y.a.peerNode || "") * tunnelSort.dir);
   } else if (tunnelSort.key === "state") {
@@ -1725,18 +1817,20 @@ function renderTunnels() {
   const currentTabAllRows = rows.filter((r) => r.t === tlSub);
   const totalCount = currentTabAllRows.length;
   const okCount = currentTabAllRows.filter((r) => r.cs.key === "ok").length;
+  const errCount = currentTabAllRows.filter((r) => r.cs.key === "err").length;
   const waitCount = currentTabAllRows.filter((r) => r.cs.key === "wait").length;
   const peeroffCount = currentTabAllRows.filter((r) => r.cs.key === "peeroff").length;
   const offCount = currentTabAllRows.filter((r) => r.cs.key === "off").length;
 
-  if ($("tlStateFilter") && $("tlStateFilter").options.length >= 5) {
+  if ($("tlStateFilter") && $("tlStateFilter").options.length >= 6) {
     const curVal = $("tlStateFilter").value || "all";
     $("tlStateFilter").options[0].textContent = `全部状态 (${totalCount})`;
     $("tlStateFilter").options[1].textContent = `🟢 仅看已连接 (${okCount})`;
-    $("tlStateFilter").options[2].textContent = `⏳ 连接中 / 重试中 (${waitCount})`;
-    $("tlStateFilter").options[3].textContent = `⚪ 对端离线 / 等待中 (${peeroffCount})`;
-    $("tlStateFilter").options[4].textContent = `🚫 仅看已停用 (${offCount})`;
-    $("tlStateFilter").options[4].style.display = tlSub === "sd" ? "none" : "";
+    $("tlStateFilter").options[2].textContent = `⚠️ 驱动/连接异常 (${errCount})`;
+    $("tlStateFilter").options[3].textContent = `⏳ 连接中 / 重试中 (${waitCount})`;
+    $("tlStateFilter").options[4].textContent = `⚪ 对端离线 / 等待中 (${peeroffCount})`;
+    $("tlStateFilter").options[5].textContent = `🚫 仅看已停用 (${offCount})`;
+    $("tlStateFilter").options[5].style.display = tlSub === "sd" ? "none" : "";
     $("tlStateFilter").value = curVal;
   }
 
@@ -1770,7 +1864,7 @@ function renderTunnels() {
       <td class="ip">${esc(a.dstHost || "localhost")}:${esc(a.dstPort)}</td>
       <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
       <td class="relay">${relay}</td>
-      <td class="${cs.cls}">${cs.txt}</td>
+      <td class="${cs.cls}" title="${esc(cs.tip || "")}">${cs.txt}</td>
       <td>${isEnabled(a, node) ? "✅" : `<a class="tag" style="color:var(--danger)">停用</a>`}</td>
       <td class="op">
         <button class="btn" data-act="toggle" data-node="${esc(node)}" data-app="${esc(a.appName)}"
@@ -1801,7 +1895,7 @@ function renderTunnels() {
       <td>${esc(nat)}</td>
       <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
       <td class="relay">${relay ? esc(relay) : '<span class="muted">P2P 直连</span>'}</td>
-      <td class="${cs.cls}">${cs.txt}</td>
+      <td class="${cs.cls}" title="${esc(cs.tip || "")}">${cs.txt}</td>
       <td class="ip">${timeHtml}</td>
     </tr>`;
     }).join("") || `<tr><td colspan="8" class="muted" style="text-align:center">无组网隧道</td></tr>`;
@@ -1822,7 +1916,14 @@ function renderTunnels() {
   }
   if ($("statActiveTunnels")) $("statActiveTunnels").textContent = activeCount;
 
-
+  // 动态更新刷新按钮文案与按需隐藏转发按钮
+  if ($("btnTlRefreshNode")) {
+    $("btnTlRefreshNode").textContent = curFilter ? `⟳ 刷新「${curFilter}」状态` : "⟳ 刷新全网状态";
+    $("btnTlRefreshNode").title = curFilter ? `重新采集「${curFilter}」的实时隧道连接状态` : "重新拉取全部在线设备的实时隧道连接状态";
+  }
+  if ($("btnAddRule")) {
+    $("btnAddRule").style.display = tlSub === "sd" ? "none" : "";
+  }
 }
 
 document.querySelectorAll(".subtab[data-tl]").forEach((b) =>
@@ -1832,6 +1933,10 @@ document.querySelectorAll(".subtab[data-tl]").forEach((b) =>
     $("tlPfWrap").classList.toggle("hidden", tlSub !== "pf");
     $("tlSdWrap").classList.toggle("hidden", tlSub !== "sd");
     renderTunnels();
+    // 切换到虚拟组网时，如果缓存超过 30s 则自动静默拉取最新链路状态
+    if (tlSub === "sd" && Date.now() - _tunnelsCacheTs > 30000) {
+      refreshTunnels(true);
+    }
   })
 );
 document.querySelectorAll("#tlTable th.sortable, #sdTable th.sortable").forEach((th) =>
@@ -1843,8 +1948,24 @@ document.querySelectorAll("#tlTable th.sortable, #sdTable th.sortable").forEach(
   })
 );
 $("tlSearch").addEventListener("input", renderTunnels);
-$("tlNodeFilter").addEventListener("change", renderTunnels);
+$("tlNodeFilter").addEventListener("change", () => {
+  renderTunnels();
+  const selected = $("tlNodeFilter").value;
+  if (selected && (!state.tunnelByNode[selected] || state.tunnelByNode[selected].length === 0)) {
+    fetchSingleNodeTunnels(selected, true);
+  }
+});
 if ($("tlStateFilter")) $("tlStateFilter").addEventListener("change", renderTunnels);
+if ($("btnTlRefreshNode")) {
+  $("btnTlRefreshNode").addEventListener("click", () => {
+    const cur = tlNodeFilterSS ? tlNodeFilterSS.getValue() : $("tlNodeFilter").value;
+    if (!cur) {
+      refreshTunnels(false, true);
+    } else {
+      fetchSingleNodeTunnels(cur, false);
+    }
+  });
+}
 
 $("tlTable").addEventListener("click", async (ev) => {
   const btn = ev.target.closest("button[data-act]");
@@ -2069,7 +2190,27 @@ function renderNetwork() {
   $("netCentralWrap").style.display = $("netMode").value === "central" ? "" : "none";
 
   const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
-  const members = s.Nodes || [];
+  let members = (s.Nodes || []).slice();
+  if (netSort.key === "name") {
+    members.sort((a, b) => (a.name || "").localeCompare(b.name || "") * netSort.dir);
+  } else if (netSort.key === "online") {
+    members.sort((a, b) => {
+      const devA = devMap[a.name];
+      const devB = devMap[b.name];
+      const onA = devA && onlineDev(devA) ? 1 : 0;
+      const onB = devB && onlineDev(devB) ? 1 : 0;
+      if (onA !== onB) return (onB - onA) * netSort.dir;
+      return (a.name || "").localeCompare(b.name || "");
+    });
+  }
+
+  // 排序列头箭头
+  document.querySelectorAll("#netTable th.sortable").forEach((th) => {
+    const arrow = th.querySelector(".sort-arrow");
+    if (arrow) arrow.textContent = netSort.key === th.dataset.sort ? (netSort.dir === 1 ? " ▲" : " ▼") : "";
+    th.classList.toggle("sorted", netSort.key === th.dataset.sort);
+  });
+
   // 连接状态：优先用 MemApps 实时缓存（subtype=17，成员级组网隧道权威数据）；
   // 未拉取过时提示拉取，由 loadMemStatus() 异步填充
   const memApps = state.memByNode || {};
@@ -2077,24 +2218,33 @@ function renderNetwork() {
     const apps = memApps[name];
     if (!apps) return { txt: "点击「刷新状态」拉取", cls: "dim" };
     if (!apps.length) return { txt: "· 无隧道", cls: "dim" };
+    const errApps = apps.filter((a) => extractTunnelError(a));
     const active = apps.filter((a) => a.isActive === 1).length;
+    if (errApps.length > 0) {
+      const isDriver = errApps.some((a) => isDriverError(extractTunnelError(a)));
+      return {
+        txt: isDriver ? `⚠️ 驱动异常 (${errApps.length}/${apps.length})` : `⚠️ 异常 (${errApps.length}/${apps.length})`,
+        cls: "cs-err",
+        tip: errApps.map((a) => `${a.peerNode}: ${extractTunnelError(a)}`).join("\n")
+      };
+    }
     return active > 0
       ? { txt: `✅ ${active}/${apps.length} 条活跃`, cls: "ok" }
       : { txt: `· 0/${apps.length} 条活跃`, cls: "dim" };
   };
 
   const tbody = $("netTable").querySelector("tbody");
-  tbody.innerHTML = members.map((m, i) => {
+  tbody.innerHTML = members.map((m) => {
     const dev = devMap[m.name];
     const st = statusOf(m.name);
     const on = dev && onlineDev(dev);
     const pubIp = dev ? dev.ip : "-";
-    return `<tr data-idx="${i}">
+    return `<tr data-name="${esc(m.name)}">
       <td class="name"><a class="member-link" data-jump="${esc(m.name)}" title="查看该成员的隧道连接状态">${esc(m.name)}</a>${dev ? "" : ' <span class="tag" style="color:var(--red)">不在设备列表</span>'}</td>
       <td><input class="input ip-input" style="width:140px" value="${esc(m.ip || "")}" data-k="ip"></td>
       <td class="ip">${copyBtn(pubIp, "ip")}</td>
       <td><span class="dot ${on ? "on" : "off"}"></span>${dev ? (on ? "在线" : "离线") : "-"}</td>
-      <td class="${st.cls}">${st.txt}</td>
+      <td class="${st.cls}" title="${esc(st.tip || "")}">${st.txt}</td>
       <td><input class="input res-input" style="width:260px" value="${esc(m.resource || "")}" data-k="resource" placeholder="192.168.3.0/24,192.168.1.8/32"></td>
       <td class="op"><button class="btn danger" data-act="rm">移除</button></td>
     </tr>`;
@@ -2223,12 +2373,24 @@ $("netTable").addEventListener("click", (ev) => {
   }
   const btn = ev.target.closest("button[data-act=rm]");
   if (!btn) return;
-  const idx = +btn.closest("tr").dataset.idx;
-  const name = state.sdwan.Nodes[idx].name;
-  state.sdwan.Nodes.splice(idx, 1);
-  renderNetwork();
-  toast(`已移除 ${name}（未保存）`);
+  const tr = btn.closest("tr");
+  const name = tr ? tr.dataset.name : "";
+  const idx = (state.sdwan?.Nodes || []).findIndex((n) => n.name === name);
+  if (idx !== -1) {
+    state.sdwan.Nodes.splice(idx, 1);
+    renderNetwork();
+    toast(`已移除 ${name}（未保存）`);
+  }
 });
+
+document.querySelectorAll("#netTable th.sortable").forEach((th) =>
+  th.addEventListener("click", () => {
+    const k = th.dataset.sort;
+    if (netSort.key === k) netSort.dir *= -1;
+    else { netSort.key = k; netSort.dir = 1; }
+    renderNetwork();
+  })
+);
 
 $("btnNetSave").addEventListener("click", async () => {
   if (!(await confirmDlg("保存虚拟网络", "将把整网配置（成员/虚拟 IP/子网代理 resource 变更）全量提交并下发到各成员，网络会短暂收敛。继续？"))) return;
@@ -2240,10 +2402,11 @@ $("btnNetSave").addEventListener("click", async () => {
   s.punchPriority = +$("netPunch").value;
   s.mtu = +$("netMtu").value || 1420;
   document.querySelectorAll("#netTable tbody tr").forEach((tr) => {
-    const idx = +tr.dataset.idx;
-    if (s.Nodes[idx]) {
-      s.Nodes[idx].ip = tr.querySelector(".ip-input").value.trim();
-      s.Nodes[idx].resource = tr.querySelector(".res-input").value.trim();
+    const name = tr.dataset.name;
+    const node = (s.Nodes || []).find((n) => n.name === name);
+    if (node) {
+      node.ip = tr.querySelector(".ip-input").value.trim();
+      node.resource = tr.querySelector(".res-input").value.trim();
     }
   });
   const saveBtn = $("btnNetSave");
@@ -2284,18 +2447,19 @@ $("btnMemRefresh").addEventListener("click", async () => {
   const dev = state.devices.find((d) => d.name === member);
   if (!dev || !onlineDev(dev)) { toast(`${member} 离线，无法读取隧道状态`, "err"); return; }
   $("memSummary").textContent = `正在读取 ${member} 的组网隧道…`;
-  const rsp = await pushCmd(member, 17, {}, 1);
-  if (rsp.status === 200 && Array.isArray(rsp.data.Apps)) {
-    state.memApps = rsp.data.Apps.slice().sort((a, b) => (a.peerNode || "").localeCompare(b.peerNode || ""));
+  const rsp = await pushCmd(member, 17, {}, 1, 10000);
+  if (rsp.status === 200 && Array.isArray(rsp.data?.Apps)) {
+    state.memApps = rsp.data.Apps.slice();
     $("memSummary").textContent = `${member} 共 ${state.memApps.length} 条组网隧道`;
   } else {
     state.memApps = [];
-    $("memSummary").textContent = `${member} 无隧道数据或读取超时（对端全离线时可能发生）`;
+    const detail = (rsp.data && rsp.data.detail) ? ` (${rsp.data.detail})` : "";
+    $("memSummary").textContent = `${member} 无隧道数据或读取超时${detail}`;
   }
   renderMemApps();
 });
 
-/** 并发受限拉取全部在线成员的组网隧道状态（subtype=17），刷新成员表连接状态列 */
+/** 并发受限拉取全部在线成员的组网隧道状态（subtype=17），渐进式刷新成员表连接状态列 */
 async function loadMemStatus() {
   const members = (state.sdwan && state.sdwan.Nodes) || [];
   const online = members.filter((m) => {
@@ -2303,34 +2467,109 @@ async function loadMemStatus() {
     return d && onlineDev(d);
   });
   if (!online.length) return;
-  const results = await runBatchLimit(online.map((m) => () => pushCmd(m.name, 17, {}, 1)), 4);
-  for (let i = 0; i < online.length; i++) {
-    const r = results[i];
-    if (r && r.status === "fulfilled" && r.value && r.value.status === 200 && Array.isArray(r.value.data.Apps)) {
-      state.memByNode[online[i].name] = r.value.data.Apps;
+
+  const tasks = online.map((m) => async () => {
+    try {
+      const r = await pushCmd(m.name, 17, {}, 1, 10000);
+      if (r && r.status === 200 && Array.isArray(r.data?.Apps)) {
+        state.memByNode[m.name] = r.data.Apps;
+        if (state.selView === "networks") renderNetwork();
+      }
+    } catch (err) {
+      console.warn(`[loadMemStatus] ${m.name} error:`, err);
     }
-  }
+  });
+
+  await runBatchLimit(tasks, 4);
   if (state.selView === "networks") renderNetwork();
 }
 
 function renderMemApps() {
   const curMember = memSelSS ? memSelSS.getValue() : $("memSel").value;
   const tbody = $("memTable").querySelector("tbody");
-  tbody.innerHTML = state.memApps.map((a) => {
+  const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
+  const curDev = devMap[curMember];
+
+  let list = (state.memApps || []).slice();
+  if (memSort.key === "online") {
+    list.sort((a, b) => {
+      const devA = devMap[a.peerNode];
+      const devB = devMap[b.peerNode];
+      const onA = devA && onlineDev(devA) ? 1 : 0;
+      const onB = devB && onlineDev(devB) ? 1 : 0;
+      if (onA !== onB) return (onB - onA) * memSort.dir;
+      const actA = a.isActive === 1 ? 1 : 0;
+      const actB = b.isActive === 1 ? 1 : 0;
+      if (actA !== actB) return (actB - actA) * memSort.dir;
+      return (a.peerNode || "").localeCompare(b.peerNode || "");
+    });
+  } else if (memSort.key === "peer") {
+    list.sort((a, b) => (a.peerNode || "").localeCompare(b.peerNode || "") * memSort.dir);
+  } else if (memSort.key === "state") {
+    const stateVal = (a) => {
+      const err = extractTunnelError(a);
+      if (err) return 0;
+      if (a.isActive === 1) return 1;
+      const peerDev = devMap[a.peerNode];
+      if (peerDev && !onlineDev(peerDev)) return 3;
+      if (a.enabled === 0) return 4;
+      return 2;
+    };
+    list.sort((a, b) => (stateVal(a) - stateVal(b)) * memSort.dir);
+  }
+
+  // 排序列头箭头
+  document.querySelectorAll("#memTable th.sortable").forEach((th) => {
+    const arrow = th.querySelector(".sort-arrow");
+    if (arrow) arrow.textContent = memSort.key === th.dataset.sort ? (memSort.dir === 1 ? " ▲" : " ▼") : "";
+    th.classList.toggle("sorted", memSort.key === th.dataset.sort);
+  });
+
+  tbody.innerHTML = list.map((a) => {
+    const peerDev = devMap[a.peerNode];
+    const isPeerOnline = peerDev && onlineDev(peerDev);
     const relay = a.specRelayNode || a.relayNode || "";
     const rawTime = a.connectTime || a.ConnectTime || a.lastConnectTime || a.activeTime;
     const timeFormatted = fmtTime(rawTime, "");
     const timeHtml = timeFormatted ? esc(timeFormatted) : (a.isActive ? `<span class="muted" title="长连接持续活跃中（客户端未产生重连时间戳）">持续活跃中</span>` : `<span class="muted">-</span>`);
+    const err = extractTunnelError(a);
+    let stHtml;
+    if (err) {
+      const isDriver = isDriverError(err);
+      stHtml = `<span class="cs-err" title="${esc(err)}">⚠️ ${isDriver ? "驱动异常" : "异常"}: ${esc(err)}</span>`;
+    } else if (a.isActive) {
+      stHtml = `<span class="cs-ok">✅ 活跃</span>`;
+    } else if (a.enabled === 0) {
+      stHtml = `<span class="cs-off">⏸ 停用</span>`;
+    } else if (peerDev && !isPeerOnline) {
+      stHtml = `<span class="cs-wait">⚪ 对端离线</span>`;
+    } else {
+      stHtml = `<span class="cs-wait">· 未连接</span>`;
+    }
+
     return `<tr>
-      <td>${esc(curMember)}</td>
-      <td class="name">${esc(a.peerNode || "-")}</td>
+      <td>${esc(curMember)}${curDev && !onlineDev(curDev) ? ' <span class="tag">离线</span>' : ""}</td>
+      <td class="name">
+        <span class="dot ${isPeerOnline ? "on" : "off"}" title="${peerDev ? (isPeerOnline ? "对端在线" : "对端离线") : "不在设备列表"}"></span>
+        ${esc(a.peerNode || "-")}
+        ${peerDev ? (isPeerOnline ? "" : ' <span class="tag">对端离线</span>') : ' <span class="tag" style="color:var(--red)">非成员</span>'}
+      </td>
       <td><span class="tag">${esc(a.linkMode || "-")}</span></td>
       <td class="relay">${relay ? esc(relay) : '<span class="muted">P2P 直连</span>'}</td>
-      <td>${a.isActive ? "✅ 活跃" : (a.enabled === 0 ? "⏸ 停用" : "· 未连接")}</td>
+      <td>${stHtml}</td>
       <td>${timeHtml}</td>
     </tr>`;
-  }).join("") || `<tr><td colspan="6" class="muted" style="text-align:center">点击右上「查看」读取所选成员的隧道状态</td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="muted" style="text-align:center">点击右上「立即读取」读取所选成员的隧道状态</td></tr>`;
 }
+
+document.querySelectorAll("#memTable th.sortable").forEach((th) =>
+  th.addEventListener("click", () => {
+    const k = th.dataset.sort;
+    if (memSort.key === k) memSort.dir *= -1;
+    else { memSort.key = k; memSort.dir = 1; }
+    renderMemApps();
+  })
+);
 
 /* ---------------- 下载安装 ---------------- */
 function renderDownload() {

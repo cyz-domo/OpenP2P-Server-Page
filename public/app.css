@@ -1261,6 +1261,7 @@ a.tag { cursor: pointer; }
 .cs-ok { color: var(--accent); font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
 .cs-wait { color: var(--amber); font-weight: 500; }
 .cs-off { color: var(--muted); }
+.cs-err { color: var(--red); font-weight: 600; display: inline-flex; align-items: center; gap: 4px; word-break: break-all; }
 
 /* ================= 虚拟网络配置 ================= */
 .net-card {
@@ -1913,10 +1914,10 @@ dialog form {
 .member-link:hover { color: var(--accent); border-bottom-color: var(--accent); }
 
 /* 可排序列头 */
-#tlTable th.sortable, #sdTable th.sortable { cursor: pointer; user-select: none; }
-#tlTable th.sortable:hover, #sdTable th.sortable:hover { color: var(--accent); }
-#tlTable th.sorted, #sdTable th.sorted { color: var(--accent); }
-#tlTable .sort-arrow, #sdTable .sort-arrow { font-size: 10px; }
+.tbl th.sortable { cursor: pointer; user-select: none; }
+.tbl th.sortable:hover { color: var(--accent); }
+.tbl th.sorted { color: var(--accent); }
+.tbl .sort-arrow { font-size: 10px; }
 
 /* ================= 隧道子标签（端口转发 / 虚拟组网） ================= */
 .subtabs {
