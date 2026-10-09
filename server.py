@@ -16,6 +16,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -28,6 +29,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
@@ -74,9 +76,52 @@ _failures: dict = {}     # ip -> [fail_count, first_fail_ts]
 # 登录专用速率限制（更严格）
 LOGIN_RATE_LIMIT = 10    # 每窗口最多 10 次登录尝试
 
-_ssl_ctx = ssl.create_default_context()
-_ssl_ctx.check_hostname = False
-_ssl_ctx.verify_mode = ssl.CERT_NONE
+
+def is_private_host(hostname: str) -> bool:
+    """检查域名或 IP 是否属于私有内网、本地回环、链路本地、运营商级 NAT 或云平台元数据地址。"""
+    if not hostname:
+        return True
+    hostname = hostname.lower().strip("[]").strip()
+    if hostname in ("localhost", "ip6-localhost", "ip6-loopback") or hostname.endswith(".local") or hostname.endswith(".internal"):
+        return True
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+            or (isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10"))
+        )
+    except ValueError:
+        return False
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """阻止 3xx 重定向逃逸至私有内网或云元数据地址。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlparse(newurl)
+        if not parsed.scheme.startswith("http"):
+            return None
+        if is_private_host(parsed.hostname or ""):
+            raise urllib.error.HTTPError(newurl, 403, "SSRF Blocked: Redirect to private network host rejected", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _create_ssl_ctx(insecure: bool = False) -> ssl.SSLContext:
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        print("[SECURITY WARNING] ⚠️ 已启用 --insecure-ssl：跳过上游 SSL/TLS 证书校验，存在中间人攻击窃听风险！")
+        return ctx
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
 
 
 def _check_rate_limit(ip: str, limit: int = RATE_LIMIT_MAX) -> bool:
@@ -387,9 +432,15 @@ class SessionManager:
 class Upstream:
     """官方控制台客户端：认证校验与代理转发。"""
 
-    def __init__(self, cfg: dict, session_mgr: SessionManager):
+    def __init__(self, cfg: dict, session_mgr: SessionManager, insecure_ssl: bool = False):
         self.cfg = cfg
         self.session_mgr = session_mgr
+        self.insecure_ssl = insecure_ssl
+        self.ssl_ctx = _create_ssl_ctx(insecure_ssl)
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=self.ssl_ctx),
+            SafeRedirectHandler(),
+        )
         self.lock = threading.Lock()
 
     @staticmethod
@@ -421,7 +472,7 @@ class Upstream:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=20, context=_ssl_ctx) as rsp:
+            with self.opener.open(req, timeout=20) as rsp:
                 return json.loads(rsp.read().decode())
         except urllib.error.HTTPError as e:
             return {"error": e.code, "detail": _sanitize_error(e.read().decode(errors="replace"))[:300]}
@@ -440,7 +491,7 @@ class Upstream:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=20, context=_ssl_ctx) as rsp:
+            with self.opener.open(req, timeout=20) as rsp:
                 data = json.loads(rsp.read().decode())
         except urllib.error.HTTPError as e:
             return {"error": e.code, "detail": _sanitize_error("token 已失效或官方服务不可达")}
@@ -477,7 +528,7 @@ class Upstream:
             headers["Content-Type"] = content_type or "application/json"
         req = urllib.request.Request(self.cfg["upstream"] + path, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=PUSH_TIMEOUT, context=_ssl_ctx) as rsp:
+            with self.opener.open(req, timeout=PUSH_TIMEOUT) as rsp:
                 return rsp.status, rsp.read(), dict(rsp.headers)
         except urllib.error.HTTPError as e:
             return e.code, _sanitize_error(e.read()).encode(), dict(e.headers)
@@ -666,6 +717,8 @@ class Handler(BaseHTTPRequestHandler):
                     "user": user,
                     "hasToken": bool(token),
                     "tokenExp": Upstream.jwt_exp(token) if token else 0,
+                    "hasCustomSecret": True,
+                    "insecureSsl": _upstream.insecure_ssl,
                     "accounts": [
                         {
                             "user": a["user"],
@@ -683,6 +736,8 @@ class Handler(BaseHTTPRequestHandler):
                     "user": "",
                     "hasToken": False,
                     "tokenExp": 0,
+                    "hasCustomSecret": True,
+                    "insecureSsl": _upstream.insecure_ssl,
                     "accounts": [],
                 })
         elif req_path == "/api/accounts/switch" and method == "POST":
@@ -727,9 +782,10 @@ class Handler(BaseHTTPRequestHandler):
             if not new_up.startswith("http://") and not new_up.startswith("https://"):
                 self._json({"error": -1, "detail": "官方控制台地址必须以 http:// 或 https:// 开头"})
                 return
-            host = (urlparse(new_up).hostname or "").lower()
-            if host not in ("console.openp2p.cn", "console.openpxp.com", "openp2p.cn", "openpxp.com"):
-                self._json({"error": -1, "detail": f"仅支持官方域名（console.openp2p.cn / console.openpxp.com），拒绝: {host}"})
+            parsed_up = urlparse(new_up)
+            host = (parsed_up.hostname or "").lower()
+            if is_private_host(host):
+                self._json({"error": -1, "detail": f"禁止配置私有内网或云元数据地址作为上游: {host}"})
                 return
             _upstream.cfg["upstream"] = new_up
             save_config(_upstream.cfg)
@@ -963,6 +1019,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.end_headers()
         self.wfile.write(body)
 
@@ -978,6 +1037,7 @@ def main():
     parser.add_argument("--user", default=None)
     parser.add_argument("--password", default=None)
     parser.add_argument("--no-save-password", action="store_true", help="不把密码写入 config.json")
+    parser.add_argument("--insecure-ssl", action="store_true", help="跳过上游 SSL/TLS 证书校验（不推荐，仅限自签名调试）")
     args = parser.parse_args()
 
     global PANEL_KEY
@@ -990,7 +1050,7 @@ def main():
     save_config(cfg)
 
     _session_mgr = SessionManager(cfg)
-    _upstream = Upstream(cfg, _session_mgr)
+    _upstream = Upstream(cfg, _session_mgr, insecure_ssl=args.insecure_ssl)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     warn = ""
