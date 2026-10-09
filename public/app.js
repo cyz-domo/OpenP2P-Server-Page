@@ -961,10 +961,20 @@ async function loginWithPasskey(targetCredId) {
       state.user = data.user;
 
       // 如果返回了更新的 cipher，同步更新本地缓存
-      if (data.passkeyCipher && matched) {
-        matched.passkeyCipher = data.passkeyCipher;
-        const updatedList = getPasskeyList().map((p) => p.credentialId === credId ? { ...p, passkeyCipher: data.passkeyCipher } : p);
-        savePasskeyList(updatedList);
+      if (data.passkeyCipher) {
+        if (matched) matched.passkeyCipher = data.passkeyCipher;
+        const curList = getPasskeyList();
+        let changed = false;
+        const updatedList = curList.map((p) => {
+          if (p.credentialId === credId) {
+            changed = true;
+            return { ...p, passkeyCipher: data.passkeyCipher };
+          }
+          return p;
+        });
+        if (changed) {
+          savePasskeyList(updatedList);
+        }
       }
 
       try {
@@ -2810,7 +2820,7 @@ $("btnSettings").addEventListener("click", () => {
   if (warnEl) {
     const warns = [];
     if (state.hasCustomSecret === false) {
-      warns.push("⚠️ 尚未配置 SESSION_SECRET 环境变量：当前系统运行于实例临时强随机密钥，实例重启后已有会话需重新登录。建议在部署环境变量中配置固定 SESSION_SECRET。");
+      warns.push("⚠️ 尚未配置 SESSION_SECRET 环境变量：当前系统运行于平台默认密钥。建议在部署环境变量中配置自定义 SESSION_SECRET 以增强多租户会话隔离安全性。");
     }
     if (state.insecureSsl) {
       warns.push("⚠️ 服务端已启用 --insecure-ssl：跳过了上游 SSL/TLS 证书校验，存在中间人攻击窃听风险！");
