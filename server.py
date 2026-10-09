@@ -731,6 +731,7 @@ class Handler(BaseHTTPRequestHandler):
                     ],
                 })
             else:
+                pool = session.get("accounts", []) if session else []
                 self._json({
                     "upstream": _upstream.cfg["upstream"],
                     "user": "",
@@ -738,7 +739,16 @@ class Handler(BaseHTTPRequestHandler):
                     "tokenExp": 0,
                     "hasCustomSecret": True,
                     "insecureSsl": _upstream.insecure_ssl,
-                    "accounts": [],
+                    "accounts": [
+                        {
+                            "user": a["user"],
+                            "hasToken": bool(a.get("token")),
+                            "tokenExp": Upstream.jwt_exp(a.get("token", "")),
+                            "hasPassword": bool(a.get("password")),
+                            "active": False,
+                        }
+                        for a in pool
+                    ],
                 })
         elif req_path == "/api/accounts/switch" and method == "POST":
             if not session:
@@ -975,10 +985,23 @@ class Handler(BaseHTTPRequestHandler):
                     rsp["detail"] = _sanitize_error(rsp["detail"])
                 self._json(rsp)
         elif req_path == "/api/logout" and method == "POST":
-            if sid:
-                _session_mgr.delete_session(sid)
-            cookie = f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
-            self._json({"ok": True}, extra_headers=[("Set-Cookie", cookie)])
+            data = {}
+            if raw:
+                try:
+                    data = json.loads(raw.decode())
+                except Exception:
+                    pass
+            if data.get("all"):
+                if sid:
+                    _session_mgr.delete_session(sid)
+                cookie = f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+                self._json({"ok": True}, extra_headers=[("Set-Cookie", cookie)])
+            else:
+                if session:
+                    with _session_mgr.lock:
+                        session["activeUser"] = ""
+                        _session_mgr._save()
+                self._json({"ok": True})
         else:
             self._json({"error": -1, "detail": "unknown panel api"}, 404)
 

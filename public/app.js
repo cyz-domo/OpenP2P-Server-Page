@@ -724,7 +724,7 @@ async function bindCurrentPasskey() {
   }
   const finalDevLabel = customName.trim() || defaultLabel;
 
-  const chalRsp = await fetch("/api/passkey/challenge", { headers: panelHeaders() }).then((r) => r.json()).catch(() => null);
+  const chalRsp = await fetch("/api/passkey/challenge", { headers: panelHeaders(), credentials: "same-origin" }).then((r) => r.json()).catch(() => null);
   if (!chalRsp || chalRsp.error !== 0) {
     toast("获取通行密钥挑战失败: " + (chalRsp?.detail || "网络超时"), "err");
     return;
@@ -765,6 +765,7 @@ async function bindCurrentPasskey() {
     const bindRsp = await fetch("/api/passkey/bind", {
       method: "POST",
       headers: panelHeaders({ "Content-Type": "application/json" }),
+      credentials: "same-origin",
       body: JSON.stringify({
         credentialId: credId,
         deviceName: finalDevLabel,
@@ -847,7 +848,7 @@ async function loginWithPasskey(targetCredId) {
   const list = getPasskeyList();
   const entry = targetCredId ? list.find((p) => p.credentialId === targetCredId) : null;
 
-  const chalRsp = await fetch("/api/passkey/challenge").then((r) => r.json()).catch(() => null);
+  const chalRsp = await fetch("/api/passkey/challenge", { headers: panelHeaders(), credentials: "same-origin" }).then((r) => r.json()).catch(() => null);
   if (!chalRsp || chalRsp.error !== 0) {
     toast("获取验证挑战失败", "err");
     return;
@@ -1143,9 +1144,60 @@ $("loginForm").addEventListener("submit", async (ev) => {
   }
 });
 
+function clearAccountSessionState() {
+  state.devices = [];
+  state.sdwan = null;
+  state.profile = null;
+  state.tunnelByNode = {};
+  state.memByNode = {};
+  state.memApps = [];
+  if (state.disabledApps && state.disabledApps.clear) {
+    state.disabledApps.clear();
+  }
+  _lastRefreshAllTs = 0;
+  _lastRefreshTunnelsTs = 0;
+  _tunnelsCacheTs = 0;
+
+  // 重置跨设备筛选框与组件选中项
+  if ($("tlNodeFilter")) $("tlNodeFilter").value = "";
+  if ($("tlSearch")) $("tlSearch").value = "";
+  if ($("devSearch")) $("devSearch").value = "";
+  if (typeof tlNodeFilterSS !== "undefined" && tlNodeFilterSS) tlNodeFilterSS.setValue("");
+  if (typeof memSelSS !== "undefined" && memSelSS) memSelSS.setValue("");
+  if (typeof netCentralSS !== "undefined" && netCentralSS) netCentralSS.setValue("");
+
+  // 重置列表展示为占位提示，避免残留老账户数据闪烁
+  if ($("devList")) $("devList").innerHTML = `<div class="muted" style="text-align:center;padding:32px 0">正在加载设备列表…</div>`;
+  if ($("tlList")) $("tlList").innerHTML = `<div class="muted" style="text-align:center;padding:32px 0">正在加载隧道规则…</div>`;
+  if ($("netTable")) {
+    const tbody = $("netTable").querySelector("tbody");
+    if (tbody) tbody.innerHTML = `<tr><td colspan="7" class="muted" style="text-align:center">正在加载网络成员…</td></tr>`;
+  }
+}
+
 $("btnLogout").addEventListener("click", async () => {
+  const accounts = state.accounts || [];
+  const otherAccounts = accounts.filter((a) => a.user !== state.user);
+  if (otherAccounts.length > 0) {
+    const ok = await confirmDlg(
+      "退出登录",
+      `当前登录为账户「${state.user}」。\n\n点击【确定】将退出当前账户并返回登录界面（其他已保存账户将保留在快捷列表中）。`
+    );
+    if (!ok) return;
+  } else {
+    if (!(await confirmDlg("退出登录", `确定退出管理面板吗？`))) return;
+  }
+
   localStorage.removeItem("panelSession");
-  await fetch("/api/logout", { method: "POST", headers: panelHeaders(), credentials: "same-origin" });
+  try {
+    await fetch("/api/logout", {
+      method: "POST",
+      headers: panelHeaders({ "Content-Type": "application/json" }),
+      credentials: "same-origin",
+      body: JSON.stringify({ all: false }),
+    });
+  } catch {}
+  clearAccountSessionState();
   location.reload();
 });
 
@@ -1157,7 +1209,8 @@ async function enterMain() {
   $("connState").className = "badge on";
   $("userInfo").textContent = state.user || "";
   renderAcctMenu(state.accounts || []);
-  await refreshAll();
+  clearAccountSessionState();
+  await refreshAll(true);
 }
 
 /* ---------------- 多账户切换 ---------------- */
@@ -1218,15 +1271,7 @@ document.addEventListener("click", async (ev) => {
       if (st.hasToken) {
         state.user = st.user;
         $("userInfo").textContent = st.user;
-        state.devices = [];
-        state.sdwan = null;
-        state.profile = null;
-        state.tunnelByNode = {};
-        state.memByNode = {};
-        state.memApps = [];
-        _lastRefreshAllTs = 0;
-        _lastRefreshTunnelsTs = 0;
-        _tunnelsCacheTs = 0;
+        clearAccountSessionState();
         state.accounts = st.accounts || [];
         renderAcctMenu(state.accounts);
         await refreshAll(true);
@@ -1246,6 +1291,9 @@ document.addEventListener("click", async (ev) => {
     $("loginView").classList.remove("hidden");
     $("linkCancelLogin").classList.remove("hidden");
     $("loginErr").classList.add("hidden");
+    if ($("loginUser")) $("loginUser").value = "";
+    if ($("loginPass")) $("loginPass").value = "";
+    renderSavedAccounts();
     if ($("tabPassword")) $("tabPassword").click();
     else await reloadCaptcha();
     return;
@@ -1274,21 +1322,7 @@ async function doSwitchAccount(targetUser) {
     $("userInfo").textContent = rsp.user;
 
     // 清空前一个账户的设备、SD-WAN虚拟组网与隧道缓存，避免跨账户数据污染
-    state.devices = [];
-    state.sdwan = null;
-    state.profile = null;
-    state.tunnelByNode = {};
-    state.memByNode = {};
-    state.memApps = [];
-    _lastRefreshAllTs = 0;
-    _lastRefreshTunnelsTs = 0;
-    _tunnelsCacheTs = 0;
-
-    // 重置跨设备筛选框
-    if ($("tlNodeFilter")) $("tlNodeFilter").value = "";
-    if ($("tlSearch")) $("tlSearch").value = "";
-    if ($("devSearch")) $("devSearch").value = "";
-    if (memSelSS) memSelSS.setValue("");
+    clearAccountSessionState();
 
     // 重新获取服务端会话状态更新账户列表及勾选高亮
     try {
@@ -2449,6 +2483,7 @@ $("memberForm").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const picked = Array.from(mdSelected);
   if (!picked.length) { $("memberDialog").close(); return; }
+  syncNetInputs();
   const used = new Set((state.sdwan.Nodes || []).map((m) => m.ip).filter(Boolean));
   for (const name of picked) {
     state.sdwan.Nodes.push({ name, ip: nextVirtualIP(used) });
@@ -2473,6 +2508,7 @@ $("netTable").addEventListener("click", (ev) => {
   }
   const btn = ev.target.closest("button[data-act=rm]");
   if (!btn) return;
+  syncNetInputs();
   const tr = btn.closest("tr");
   const name = tr ? tr.dataset.name : "";
   const idx = (state.sdwan?.Nodes || []).findIndex((n) => n.name === name);
@@ -2934,6 +2970,68 @@ document.querySelectorAll(".tab").forEach((t) =>
   })
 );
 
+/* ---------------- 登录页已保存账户快捷入口 ---------------- */
+function renderSavedAccounts() {
+  const wrap = $("savedAccountsWrap");
+  if (!wrap) return;
+  const accounts = (state.accounts || []).filter((a) => a.user);
+  if (!accounts.length) {
+    wrap.classList.add("hidden");
+    wrap.innerHTML = "";
+    return;
+  }
+  wrap.classList.remove("hidden");
+  wrap.innerHTML = `
+    <div class="saved-accounts-title">
+      <span>💾 已保存的账户（点击快捷登入）</span>
+      <span class="saved-accounts-clear" id="btnClearAllSaved">清空本地凭据</span>
+    </div>
+    <div class="saved-accounts-list">
+      ${accounts.map((a) => `
+        <button type="button" class="saved-account-pill" data-user="${esc(a.user)}">
+          <span>👤 ${esc(a.user)}</span>
+          <span class="sub">${a.hasToken ? "已授权" : (a.hasPassword ? "有密码" : "")}</span>
+        </button>
+      `).join("")}
+    </div>
+  `;
+
+  wrap.querySelectorAll(".saved-account-pill[data-user]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const u = btn.dataset.user;
+      const acc = accounts.find((x) => x.user === u);
+      if (acc && (acc.hasToken || acc.hasPassword)) {
+        toast(`正在以「${u}」登录…`);
+        const rsp = await pxp2("/api/accounts/switch", { user: u });
+        if (rsp.error === 0) {
+          state.user = rsp.user;
+          await enterMain();
+          return;
+        }
+      }
+      // 若无有效凭据，将用户名填入并聚焦密码输入框
+      if ($("loginUser")) $("loginUser").value = u;
+      if ($("tabPassword")) $("tabPassword").click();
+      if ($("loginPass")) $("loginPass").focus();
+    });
+  });
+
+  const clearBtn = $("btnClearAllSaved");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", async () => {
+      if (!(await confirmDlg("清空本地凭据", "确定彻底清除本设备上保存的所有账户与会话吗？"))) return;
+      localStorage.removeItem("panelSession");
+      await fetch("/api/logout", {
+        method: "POST",
+        headers: panelHeaders({ "Content-Type": "application/json" }),
+        credentials: "same-origin",
+        body: JSON.stringify({ all: true }),
+      });
+      location.reload();
+    });
+  }
+}
+
 /* ---------------- 启动 ---------------- */
 (async () => {
   if (await checkState()) {
@@ -2944,6 +3042,7 @@ document.querySelectorAll(".tab").forEach((t) =>
     if ($("linkCancelLogin")) $("linkCancelLogin").classList.add("hidden");
     $("connState").textContent = "未登录";
     if (state.user) $("loginUser").value = state.user;
+    renderSavedAccounts();
     const pkeys = getPasskeyList();
     if (pkeys.length && $("tabPasskey")) {
       $("tabPasskey").click();

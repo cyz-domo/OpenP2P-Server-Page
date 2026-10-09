@@ -314,11 +314,14 @@ async function getSession(request) {
   }
 }
 
-async function createSessionCookie(sessionData) {
+async function createSessionCookie(sessionData, maxAge = SESSION_TTL) {
+  if (maxAge === 0) {
+    return `${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure`;
+  }
   const env = getEnv();
   const secret = getSessionSecret(env);
   const encrypted = await encryptData(JSON.stringify(sessionData), secret);
-  return `${SESSION_COOKIE_NAME}=${encodeURIComponent(encrypted)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; SameSite=Lax; Secure`;
+  return `${SESSION_COOKIE_NAME}=${encodeURIComponent(encrypted)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax; Secure`;
 }
 
 function applySecurityHeaders(headers) {
@@ -690,9 +693,16 @@ export default async function handler(request) {
 
     // 4. 退出登录
     if (pathname === "/api/logout" && method === "POST") {
-      const pool = (session.accounts || []).filter((a) => a.user !== session.activeUser);
-      session.accounts = pool;
-      session.activeUser = pool.length > 0 ? pool[0].user : "";
+      let body = {};
+      try { body = await request.json(); } catch {}
+      if (body.all) {
+        session.accounts = [];
+        session.activeUser = "";
+        const cookie = await createSessionCookie(session, 0);
+        return jsonRsp({ ok: true }, 200, { "Set-Cookie": cookie });
+      }
+      // 默认退出当前登录状态，回到登录页；保留已保存的多账户凭据
+      session.activeUser = "";
       const cookie = await createSessionCookie(session);
       return jsonRsp({ ok: true }, 200, { "Set-Cookie": cookie });
     }
