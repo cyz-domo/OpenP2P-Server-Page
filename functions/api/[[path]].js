@@ -6,7 +6,23 @@
 const DEFAULT_UPSTREAM = "https://console.openpxp.com";
 const SESSION_COOKIE_NAME = "openp2p_session";
 const SESSION_TTL = 30 * 24 * 3600; // 30天
-const DEFAULT_SECRET = "openp2p-edgeone-aes-secret-key-32bytes-v2";
+
+/* ---------------- 运行时密钥管理 ---------------- */
+let _runtimeEphemeralSecret = null;
+
+function getSessionSecret(env) {
+  const custom = env && typeof env.SESSION_SECRET === "string" ? env.SESSION_SECRET.trim() : "";
+  if (custom) return custom;
+  if (!_runtimeEphemeralSecret) {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    let binary = "";
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    _runtimeEphemeralSecret = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    console.warn("[SECURITY NOTICE] 未配置 SESSION_SECRET 环境变量，系统已自动生成 256 位实例内存强随机密钥。建议在部署环境变量中配置固定 SESSION_SECRET。");
+  }
+  return _runtimeEphemeralSecret;
+}
 
 /* ---------------- 基础工具与 Base64 ---------------- */
 function base64UrlEncode(strOrBuffer) {
@@ -38,7 +54,7 @@ let _cachedAesKey = null;
 let _cachedAesSecret = null;
 
 async function getDerivedAesKey(secret) {
-  const currentSecret = secret || DEFAULT_SECRET;
+  const currentSecret = secret || getSessionSecret();
   if (_cachedAesKey && _cachedAesSecret === currentSecret) {
     return _cachedAesKey;
   }
@@ -83,7 +99,7 @@ let _cachedHmacKey = null;
 let _cachedHmacSecret = null;
 
 async function getHmacKey(secret) {
-  const currentSecret = secret || DEFAULT_SECRET;
+  const currentSecret = secret || getSessionSecret();
   if (_cachedHmacKey && _cachedHmacSecret === currentSecret) {
     return _cachedHmacKey;
   }
@@ -121,19 +137,44 @@ async function verifyData(signedStr, secret) {
 /* ---------------- SSRF 内网地址检测 ---------------- */
 function isPrivateHost(hostname) {
   if (!hostname) return true;
-  hostname = hostname.toLowerCase().trim();
-  if (hostname === "localhost" || hostname.endsWith(".local") || hostname.endsWith(".internal")) return true;
+  hostname = hostname.replace(/^\[|\]$/g, "").toLowerCase().trim();
+  if (
+    hostname === "localhost" ||
+    hostname === "ip6-localhost" ||
+    hostname === "ip6-loopback" ||
+    hostname === "instance-data" ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal")
+  ) {
+    return true;
+  }
+  if (hostname.startsWith("::ffff:")) {
+    hostname = hostname.slice(7);
+  }
   const parts = hostname.split(".");
   if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) {
     const [a, b, c, d] = parts.map(Number);
-    if (a === 127) return true; // 127.0.0.0/8
-    if (a === 10) return true;  // 10.0.0.0/8
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-    if (a === 192 && b === 168) return true; // 192.168.0.0/16
-    if (a === 169 && b === 254) return true; // 169.254.0.0/16 (Link-Local & Cloud Metadata)
-    if (a === 0 || a >= 224) return true; // 0.0.0.0/8, Multicast & Reserved
+    if (
+      a === 0 ||
+      a === 10 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      a >= 224
+    ) {
+      return true;
+    }
   }
-  if (hostname === "::1" || hostname.startsWith("fe80:") || hostname.startsWith("fc00:") || hostname.startsWith("fd00:")) return true;
+  if (
+    hostname === "::1" ||
+    hostname.startsWith("fe80:") ||
+    hostname.startsWith("fc00:") ||
+    hostname.startsWith("fd00:")
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -204,7 +245,7 @@ function parseCookies(header) {
 }
 
 async function getSession(request, env) {
-  const secret = (env && env.SESSION_SECRET) || DEFAULT_SECRET;
+  const secret = getSessionSecret(env);
   const cookieHeader = request.headers.get("Cookie") || "";
   const cookies = parseCookies(cookieHeader);
   const rawCookie = cookies[SESSION_COOKIE_NAME] || request.headers.get("X-Session-Id");
@@ -227,7 +268,7 @@ async function getSession(request, env) {
 }
 
 async function createSessionCookie(sessionData, env) {
-  const secret = (env && env.SESSION_SECRET) || DEFAULT_SECRET;
+  const secret = getSessionSecret(env);
   const encrypted = await encryptData(JSON.stringify(sessionData), secret);
   return `${SESSION_COOKIE_NAME}=${encodeURIComponent(encrypted)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; SameSite=Lax; Secure`;
 }
@@ -303,8 +344,21 @@ export async function onRequest(context) {
         method,
         headers: fwdHeaders,
         body: reqBody,
-        redirect: "follow",
+        redirect: "manual",
       });
+
+      // 严格检查 3xx 重定向，防止重定向逃逸至云元数据 (169.254.169.254) 或内部私网
+      if (upstreamRsp.status >= 300 && upstreamRsp.status < 400) {
+        const loc = upstreamRsp.headers.get("Location") || "";
+        try {
+          const locUrl = new URL(loc, targetUrl);
+          if (isPrivateHost(locUrl.hostname)) {
+            return jsonRsp({ error: 403, detail: "SSRF Blocked: 上游重定向至私有地址已被拦截" }, 403);
+          }
+        } catch {
+          return jsonRsp({ error: 400, detail: "上游重定向目标不合法" }, 400);
+        }
+      }
 
       const respData = await upstreamRsp.arrayBuffer();
       const respHeaders = new Headers(upstreamRsp.headers);
@@ -336,6 +390,8 @@ export async function onRequest(context) {
       user,
       hasToken: Boolean(token),
       tokenExp: token ? jwtExp(token) : 0,
+      hasCustomSecret: Boolean((env.SESSION_SECRET || "").trim()),
+      insecureSsl: false,
       accounts: pool.map((a) => ({
         user: a.user,
         hasToken: Boolean(a.token),
@@ -348,7 +404,7 @@ export async function onRequest(context) {
 
   // 2. 验证码接口 (有效期缩短至 2 分钟，防重放时间窗口)
   if (pathname === "/api/captcha" && (method === "GET" || method === "POST")) {
-    const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+    const secret = getSessionSecret(env);
     const theme = url.searchParams.get("theme") || request.headers.get("X-Panel-Theme") || "dark";
     const code = Math.floor(1000 + Math.random() * 9000).toString();
     const nonce = Math.random().toString(36).slice(2, 8);
@@ -366,7 +422,7 @@ export async function onRequest(context) {
 
   // 2.2 通行密钥 (Passkey) - 绑定凭据 (需在登录态下执行)
   if (pathname === "/api/passkey/bind" && method === "POST") {
-    const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+    const secret = getSessionSecret(env);
     if (!session.activeUser) {
       return jsonRsp({ error: 401, detail: "请先登录后再绑定通行密钥" }, 401);
     }
@@ -403,7 +459,7 @@ export async function onRequest(context) {
 
   // 2.3 通行密钥 (Passkey) - 验证登录
   if (pathname === "/api/passkey/login" && method === "POST") {
-    const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+    const secret = getSessionSecret(env);
     let body;
     try { body = await request.json(); } catch { return jsonRsp({ error: -1, detail: "参数错误" }, 400); }
 
@@ -462,7 +518,7 @@ export async function onRequest(context) {
 
   // 3. 登录接口 (支持账号密码与 Token 登录)
   if ((pathname === "/api/login" || pathname === "/api/login-token") && method === "POST") {
-    const secret = env.SESSION_SECRET || DEFAULT_SECRET;
+    const secret = getSessionSecret(env);
     let body;
     try {
       body = await request.json();

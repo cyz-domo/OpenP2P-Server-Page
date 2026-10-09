@@ -6,7 +6,23 @@
 
 const DEFAULT_UPSTREAM = "https://console.openpxp.com";
 const SESSION_COOKIE_NAME = "openp2p_session";
-const DEFAULT_SECRET = "openp2p-edgeone-aes-secret-key-32bytes-v2";
+
+/* ---------------- 运行时密钥管理 ---------------- */
+let _runtimeEphemeralSecret = null;
+
+function getSessionSecret(env) {
+  const custom = env && typeof env.SESSION_SECRET === "string" ? env.SESSION_SECRET.trim() : "";
+  if (custom) return custom;
+  if (!_runtimeEphemeralSecret) {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    let binary = "";
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    _runtimeEphemeralSecret = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    console.warn("[SECURITY NOTICE] 未配置 SESSION_SECRET 环境变量，系统已自动生成 256 位实例内存强随机密钥。建议在部署环境变量中配置固定 SESSION_SECRET。");
+  }
+  return _runtimeEphemeralSecret;
+}
 
 /* ---------------- 基础工具与 Base64 ---------------- */
 function base64UrlDecodeBytes(str) {
@@ -29,7 +45,7 @@ let _cachedAesKey = null;
 let _cachedAesSecret = null;
 
 async function getDerivedAesKey(secret) {
-  const currentSecret = secret || DEFAULT_SECRET;
+  const currentSecret = secret || getSessionSecret();
   if (_cachedAesKey && _cachedAesSecret === currentSecret) {
     return _cachedAesKey;
   }
@@ -68,7 +84,7 @@ async function verifyData(signedStr, secret) {
   const [b64Data, b64Sig] = signedStr.split(".");
   try {
     const rawData = base64UrlDecode(b64Data);
-    const currentSecret = secret || DEFAULT_SECRET;
+    const currentSecret = secret || getSessionSecret();
     if (!_cachedHmacKey || _cachedHmacSecret !== currentSecret) {
       _cachedHmacKey = await crypto.subtle.importKey(
         "raw",
@@ -90,16 +106,44 @@ async function verifyData(signedStr, secret) {
 /* ---------------- SSRF 校验 ---------------- */
 function isPrivateHost(hostname) {
   if (!hostname) return true;
-  hostname = hostname.toLowerCase().trim();
-  if (hostname === "localhost" || hostname.endsWith(".local") || hostname.endsWith(".internal")) return true;
+  hostname = hostname.replace(/^\[|\]$/g, "").toLowerCase().trim();
+  if (
+    hostname === "localhost" ||
+    hostname === "ip6-localhost" ||
+    hostname === "ip6-loopback" ||
+    hostname === "instance-data" ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal")
+  ) {
+    return true;
+  }
+  if (hostname.startsWith("::ffff:")) {
+    hostname = hostname.slice(7);
+  }
   const parts = hostname.split(".");
   if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) {
     const [a, b, c, d] = parts.map(Number);
-    if (a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 0 || a >= 224) {
+    if (
+      a === 0 ||
+      a === 10 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      a >= 224
+    ) {
       return true;
     }
   }
-  if (hostname === "::1" || hostname.startsWith("fe80:") || hostname.startsWith("fc00:") || hostname.startsWith("fd00:")) return true;
+  if (
+    hostname === "::1" ||
+    hostname.startsWith("fe80:") ||
+    hostname.startsWith("fc00:") ||
+    hostname.startsWith("fd00:")
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -128,7 +172,7 @@ function parseCookies(header) {
 }
 
 async function getSession(request, env) {
-  const secret = (env && env.SESSION_SECRET) || DEFAULT_SECRET;
+  const secret = getSessionSecret(env);
   const cookieHeader = request.headers.get("Cookie") || "";
   const cookies = parseCookies(cookieHeader);
   const rawCookie = cookies[SESSION_COOKIE_NAME] || request.headers.get("X-Session-Id");
@@ -223,8 +267,20 @@ export async function onRequest(context) {
       method,
       headers: fwdHeaders,
       body: ["GET", "HEAD"].includes(method) ? undefined : await request.arrayBuffer(),
-      redirect: "follow",
+      redirect: "manual",
     });
+
+    if (upstreamRsp.status >= 300 && upstreamRsp.status < 400) {
+      const loc = upstreamRsp.headers.get("Location") || "";
+      try {
+        const locUrl = new URL(loc, targetUrl);
+        if (isPrivateHost(locUrl.hostname)) {
+          return jsonRsp({ error: 403, detail: "SSRF Blocked: 上游重定向至私有地址已被拦截" }, 403);
+        }
+      } catch {
+        return jsonRsp({ error: 400, detail: "上游重定向目标不合法" }, 400);
+      }
+    }
 
     const respData = await upstreamRsp.arrayBuffer();
     const respHeaders = new Headers(upstreamRsp.headers);
