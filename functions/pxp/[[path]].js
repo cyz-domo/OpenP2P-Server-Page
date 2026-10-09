@@ -299,22 +299,38 @@ export async function onRequest(context) {
   if (token) fwdHeaders.set("Authorization", token);
 
   try {
-    const upstreamRsp = await fetch(targetUrl, {
-      method,
-      headers: fwdHeaders,
-      body: ["GET", "HEAD"].includes(method) ? undefined : await request.arrayBuffer(),
-      redirect: "manual",
-    });
+    const reqBody = ["GET", "HEAD"].includes(method) ? undefined : await request.arrayBuffer();
+    let curUrl = targetUrl;
+    let upstreamRsp = null;
+    let redirectHops = 0;
 
-    if (upstreamRsp.status >= 300 && upstreamRsp.status < 400) {
-      const loc = upstreamRsp.headers.get("Location") || "";
-      try {
-        const locUrl = new URL(loc, targetUrl);
-        if (isPrivateHost(locUrl.hostname)) {
-          return jsonRsp({ error: 403, detail: "SSRF Blocked: 上游重定向至私有地址已被拦截" }, 403);
+    while (redirectHops < 5) {
+      const curMethod = redirectHops === 0 ? method : (upstreamRsp && [301, 302, 303].includes(upstreamRsp.status) ? "GET" : method);
+      const curBody = redirectHops === 0 ? reqBody : undefined;
+
+      upstreamRsp = await fetch(curUrl, {
+        method: curMethod,
+        headers: fwdHeaders,
+        body: curBody,
+        redirect: "manual",
+      });
+
+      if (upstreamRsp.status >= 300 && upstreamRsp.status < 400) {
+        const loc = upstreamRsp.headers.get("Location") || "";
+        if (!loc) break;
+        let nextUrl;
+        try {
+          nextUrl = new URL(loc, curUrl);
+        } catch {
+          return jsonRsp({ error: 400, detail: "上游重定向目标不合法" }, 400);
         }
-      } catch {
-        return jsonRsp({ error: 400, detail: "上游重定向目标不合法" }, 400);
+        if (nextUrl.protocol !== "https:" || isPrivateHost(nextUrl.hostname)) {
+          return jsonRsp({ error: 403, detail: "SSRF Blocked: 上游重定向至私有或非安全地址已被拦截" }, 403);
+        }
+        curUrl = nextUrl.toString();
+        redirectHops++;
+      } else {
+        break;
       }
     }
 
