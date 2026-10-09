@@ -8,20 +8,24 @@ const DEFAULT_UPSTREAM = "https://console.openpxp.com";
 const SESSION_COOKIE_NAME = "openp2p_session";
 
 /* ---------------- 运行时密钥管理 ---------------- */
-let _runtimeEphemeralSecret = null;
+const DEFAULT_SECRET = "openp2p-edgeone-aes-secret-key-32bytes-v2";
+const LEGACY_FALLBACK_SECRETS = [
+  "openp2p-edgeone-aes-secret-key-32bytes-v2",
+  "openp2p-vercel-aes-secret-key-32bytes-v2",
+  "openp2p-cloudflare-aes-secret-key-32bytes-v2",
+  "openp2p-default-aes-secret-key-32bytes",
+  "openp2p-default-aes-secret-key-32bytes-v2"
+];
 
+let _hasWarnedSecret = false;
 function getSessionSecret(env) {
   const custom = env && typeof env.SESSION_SECRET === "string" ? env.SESSION_SECRET.trim() : "";
   if (custom) return custom;
-  if (!_runtimeEphemeralSecret) {
-    const bytes = new Uint8Array(32);
-    crypto.getRandomValues(bytes);
-    let binary = "";
-    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-    _runtimeEphemeralSecret = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    console.warn("[SECURITY NOTICE] 未配置 SESSION_SECRET 环境变量，系统已自动生成 256 位实例内存强随机密钥。建议在部署环境变量中配置固定 SESSION_SECRET。");
+  if (!_hasWarnedSecret) {
+    _hasWarnedSecret = true;
+    console.warn("[SECURITY NOTICE] 未配置 SESSION_SECRET 环境变量，当前使用平台默认会话密钥。建议在部署环境变量中配置固定 SESSION_SECRET。");
   }
-  return _runtimeEphemeralSecret;
+  return DEFAULT_SECRET;
 }
 
 /* ---------------- 基础工具与 Base64 ---------------- */
@@ -40,35 +44,35 @@ function base64UrlDecode(str) {
   return new TextDecoder().decode(base64UrlDecodeBytes(str));
 }
 
-/* ---------------- AES-GCM-256 解密与 HMAC 校验 (带内存 Key 单例缓存) ---------------- */
-let _cachedAesKey = null;
-let _cachedAesSecret = null;
+/* ---------------- AES-GCM-256 解密与 HMAC 校验 (带内存 Key Map 缓存与平滑回退) ---------------- */
+const _cachedAesKeys = new Map();
 
-async function getDerivedAesKey(secret) {
-  const currentSecret = secret || getSessionSecret();
-  if (_cachedAesKey && _cachedAesSecret === currentSecret) {
-    return _cachedAesKey;
+async function getDerivedAesKey(secret, env) {
+  const currentSecret = secret || getSessionSecret(env);
+  if (_cachedAesKeys.has(currentSecret)) {
+    return _cachedAesKeys.get(currentSecret);
   }
   const enc = new TextEncoder();
   const baseKey = await crypto.subtle.importKey("raw", enc.encode(currentSecret), "PBKDF2", false, ["deriveKey"]);
-  _cachedAesKey = await crypto.subtle.deriveKey(
+  const derived = await crypto.subtle.deriveKey(
     { name: "PBKDF2", salt: enc.encode("openp2p-salt-2026"), iterations: 10000, hash: "SHA-256" },
     baseKey,
     { name: "AES-GCM", length: 256 },
     false,
     ["decrypt"]
   );
-  _cachedAesSecret = currentSecret;
-  return _cachedAesKey;
+  if (_cachedAesKeys.size > 20) _cachedAesKeys.clear();
+  _cachedAesKeys.set(currentSecret, derived);
+  return derived;
 }
 
-async function decryptData(cipherB64, secret) {
+async function decryptWithSecret(cipherB64, secret, env) {
   try {
     const raw = base64UrlDecodeBytes(cipherB64);
     if (raw.byteLength <= 12) return null;
     const iv = raw.slice(0, 12);
     const data = raw.slice(12);
-    const key = await getDerivedAesKey(secret);
+    const key = await getDerivedAesKey(secret, env);
     const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
     return new TextDecoder().decode(decrypted);
   } catch {
@@ -76,31 +80,63 @@ async function decryptData(cipherB64, secret) {
   }
 }
 
-let _cachedHmacKey = null;
-let _cachedHmacSecret = null;
+async function decryptData(cipherB64, secret, env) {
+  const currentSecret = secret || getSessionSecret(env);
+  const primary = await decryptWithSecret(cipherB64, currentSecret, env);
+  if (primary !== null) return primary;
 
-async function verifyData(signedStr, secret) {
-  if (!signedStr || !signedStr.includes(".")) return null;
-  const [b64Data, b64Sig] = signedStr.split(".");
-  try {
-    const rawData = base64UrlDecode(b64Data);
-    const currentSecret = secret || getSessionSecret();
-    if (!_cachedHmacKey || _cachedHmacSecret !== currentSecret) {
-      _cachedHmacKey = await crypto.subtle.importKey(
-        "raw",
-        new TextEncoder().encode(currentSecret),
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["verify"]
-      );
-      _cachedHmacSecret = currentSecret;
-    }
-    const sigBytes = base64UrlDecodeBytes(b64Sig);
-    const valid = await crypto.subtle.verify("HMAC", _cachedHmacKey, sigBytes, new TextEncoder().encode(rawData));
-    return valid ? rawData : null;
-  } catch {
-    return null;
+  for (const legacy of LEGACY_FALLBACK_SECRETS) {
+    if (legacy === currentSecret) continue;
+    const fallback = await decryptWithSecret(cipherB64, legacy, env);
+    if (fallback !== null) return fallback;
   }
+  return null;
+}
+
+const _cachedHmacKeys = new Map();
+
+async function getHmacKey(secret, env) {
+  const currentSecret = secret || getSessionSecret(env);
+  if (_cachedHmacKeys.has(currentSecret)) {
+    return _cachedHmacKeys.get(currentSecret);
+  }
+  const derived = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(currentSecret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  if (_cachedHmacKeys.size > 20) _cachedHmacKeys.clear();
+  _cachedHmacKeys.set(currentSecret, derived);
+  return derived;
+}
+
+async function verifyData(signedStr, secret, env) {
+  if (!signedStr || !signedStr.includes(".")) return null;
+  const currentSecret = secret || getSessionSecret(env);
+  const [b64Data, b64Sig] = signedStr.split(".");
+  const tryVerify = async (sec) => {
+    try {
+      const rawData = base64UrlDecode(b64Data);
+      const key = await getHmacKey(sec, env);
+      const sigBytes = base64UrlDecodeBytes(b64Sig);
+      const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(rawData));
+      return valid ? rawData : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const primary = await tryVerify(currentSecret);
+  if (primary !== null) return primary;
+
+  for (const legacy of LEGACY_FALLBACK_SECRETS) {
+    if (legacy === currentSecret) continue;
+    const fallback = await tryVerify(legacy);
+    if (fallback !== null) return fallback;
+  }
+  return null;
 }
 
 /* ---------------- SSRF 校验 ---------------- */
