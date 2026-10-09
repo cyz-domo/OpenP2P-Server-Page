@@ -1914,10 +1914,12 @@ dialog form {
 .member-link:hover { color: var(--accent); border-bottom-color: var(--accent); }
 
 /* 可排序列头 */
-.tbl th.sortable { cursor: pointer; user-select: none; }
+.tbl th.sortable { cursor: pointer; user-select: none; transition: color 0.15s ease; }
 .tbl th.sortable:hover { color: var(--accent); }
-.tbl th.sorted { color: var(--accent); }
-.tbl .sort-arrow { font-size: 10px; }
+.tbl th.sorted { color: var(--accent); font-weight: 700; }
+.tbl .sort-arrow { font-size: 11px; margin-left: 4px; opacity: 0.55; display: inline-block; vertical-align: middle; }
+.tbl th.sortable:hover .sort-arrow { opacity: 0.85; }
+.tbl th.sorted .sort-arrow { opacity: 1; color: var(--accent); }
 
 /* ================= 隧道子标签（端口转发 / 虚拟组网） ================= */
 .subtabs {
