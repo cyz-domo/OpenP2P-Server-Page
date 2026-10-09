@@ -6,7 +6,7 @@ const API = "/api/pxp"; // 反向代理前缀 (统一走 /api/ 路由以适配 V
 
 /* ---------------- 状态 ---------------- */
 const tunnelSort = { key: "state", dir: 1 }; // 隧道表排序（默认按连接状态，已连接在前）
-const netSort = { key: "", dir: 1 }; // 网络成员表排序（节点设备名或在线状态）
+const netSort = { key: "online", dir: 1 }; // 网络成员表排序（默认在线状态优先，可点击切换设备名或在线状态）
 const memSort = { key: "online", dir: 1 }; // 成员透视表排序（默认在线状态优先）
 let tlSub = "pf"; // 隧道子视图：pf=端口转发 sd=虚拟组网
 const state = {
@@ -1741,25 +1741,53 @@ function ruleType(rule) {
 function renderTunnels() {
   initSearchSelects();
   const curFilter = tlNodeFilterSS ? tlNodeFilterSS.getValue() : ($("tlNodeFilter").value || "");
-  const filterOptions = [
-    { value: "", label: "全部设备", subtext: `共 ${state.devices.length} 台` },
-    ...state.devices.map((d) => ({
-      value: d.name,
-      label: d.name,
-      online: onlineDev(d),
-      subtext: `${onlineDev(d) ? "🟢 在线" : "⚪ 离线"} · ${d.ip || "-"}${d.os ? " · " + d.os : ""}`
-    }))
-  ];
+  const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
+  const netMembers = (state.sdwan && state.sdwan.Nodes) || [];
+  const netMemberNames = new Set(netMembers.map((m) => m.name));
+
+  let filterOptions;
+  if (tlSub === "sd") {
+    // 虚拟组网仅显示已加入虚拟网络的成员设备，未加入的不添加进来
+    filterOptions = [
+      { value: "", label: "全部组网成员", subtext: `共 ${netMembers.length} 台成员` },
+      ...netMembers.map((m) => {
+        const d = devMap[m.name];
+        const on = d && onlineDev(d);
+        return {
+          value: m.name,
+          label: m.name,
+          online: on,
+          subtext: `${on ? "🟢 在线" : "⚪ 离线"} · 虚拟IP:${m.ip || "未分配"}${d?.ip ? ` · 公网:${d.ip}` : ""}`
+        };
+      })
+    ];
+  } else {
+    // 端口转发显示全部设备
+    filterOptions = [
+      { value: "", label: "全部设备", subtext: `共 ${state.devices.length} 台` },
+      ...state.devices.map((d) => ({
+        value: d.name,
+        label: d.name,
+        online: onlineDev(d),
+        subtext: `${onlineDev(d) ? "🟢 在线" : "⚪ 离线"} · ${d.ip || "-"}${d.os ? " · " + d.os : ""}`
+      }))
+    ];
+  }
+
+  // 如果在虚拟组网下，当前选中的设备未加入虚拟网络，则自动重置为空（全部组网成员）
+  let targetFilter = curFilter;
+  if (tlSub === "sd" && targetFilter && !netMemberNames.has(targetFilter)) {
+    targetFilter = "";
+  }
+
   if (tlNodeFilterSS) {
     tlNodeFilterSS.setOptions(filterOptions);
-    tlNodeFilterSS.setValue(curFilter);
+    tlNodeFilterSS.setValue(targetFilter);
   }
-  const nodeFilter = tlNodeFilterSS ? tlNodeFilterSS.getValue() : ($("tlNodeFilter").value || "");
+  const nodeFilter = tlNodeFilterSS ? tlNodeFilterSS.getValue() : targetFilter;
   const stateFilter = $("tlStateFilter") ? $("tlStateFilter").value : "all";
   const kw = $("tlSearch").value.trim().toLowerCase();
 
-
-  const devMap = Object.fromEntries(state.devices.map((d) => [d.name, d]));
   // 连接状态四态推导（字段语义来自实测：isActive=1 已连接；connectTime 为 0001-01-01 零值表示从未连上）
   const ZERO_TIME = "0001-01-01";
   const isEnabled = (a, node) => {
@@ -1793,9 +1821,13 @@ function renderTunnels() {
 
   const rows = [];
   for (const [node, apps] of Object.entries(state.tunnelByNode)) {
+    // 虚拟组网下，所在设备必须是已加入虚拟网络的成员
+    if (tlSub === "sd" && !netMemberNames.has(node)) continue;
     if (nodeFilter && node !== nodeFilter) continue;
     for (const a of apps) {
       const t = ruleType(a);
+      // 虚拟组网下，对端设备也必须是已加入虚拟网络的成员
+      if (t === "sd" && a.peerNode && !netMemberNames.has(a.peerNode)) continue;
       if (kw) {
         const hay = [a.appName, a.peerNode, a.dstHost, a.relayNode, a.specRelayNode, a.linkMode].join(" ").toLowerCase();
         if (!hay.includes(kw)) continue;
@@ -1904,8 +1936,9 @@ function renderTunnels() {
   // 排序列头箭头（两张表各自处理）
   document.querySelectorAll("#tlTable th.sortable, #sdTable th.sortable").forEach((th) => {
     const arrow = th.querySelector(".sort-arrow");
-    if (arrow) arrow.textContent = tunnelSort.key === th.dataset.sort ? (tunnelSort.dir === 1 ? " ▲" : " ▼") : "";
-    th.classList.toggle("sorted", tunnelSort.key === th.dataset.sort);
+    const isSorted = tunnelSort.key === th.dataset.sort;
+    if (arrow) arrow.textContent = isSorted ? (tunnelSort.dir === 1 ? " ▲" : " ▼") : " ⇅";
+    th.classList.toggle("sorted", isSorted);
   });
 
   let activeCount = 0;
@@ -2207,8 +2240,9 @@ function renderNetwork() {
   // 排序列头箭头
   document.querySelectorAll("#netTable th.sortable").forEach((th) => {
     const arrow = th.querySelector(".sort-arrow");
-    if (arrow) arrow.textContent = netSort.key === th.dataset.sort ? (netSort.dir === 1 ? " ▲" : " ▼") : "";
-    th.classList.toggle("sorted", netSort.key === th.dataset.sort);
+    const isSorted = netSort.key === th.dataset.sort;
+    if (arrow) arrow.textContent = isSorted ? (netSort.dir === 1 ? " ▲" : " ▼") : " ⇅";
+    th.classList.toggle("sorted", isSorted);
   });
 
   // 连接状态：优先用 MemApps 实时缓存（subtype=17，成员级组网隧道权威数据）；
@@ -2383,12 +2417,31 @@ $("netTable").addEventListener("click", (ev) => {
   }
 });
 
+function syncNetInputs() {
+  const s = state.sdwan;
+  if (!s || !s.Nodes) return;
+  document.querySelectorAll("#netTable tbody tr").forEach((tr) => {
+    const name = tr.dataset.name;
+    const node = (s.Nodes || []).find((n) => n.name === name);
+    if (node) {
+      const ipEl = tr.querySelector(".ip-input");
+      const resEl = tr.querySelector(".res-input");
+      if (ipEl) node.ip = ipEl.value.trim();
+      if (resEl) node.resource = resEl.value.trim();
+    }
+  });
+}
+
 document.querySelectorAll("#netTable th.sortable").forEach((th) =>
   th.addEventListener("click", () => {
+    syncNetInputs();
     const k = th.dataset.sort;
     if (netSort.key === k) netSort.dir *= -1;
     else { netSort.key = k; netSort.dir = 1; }
     renderNetwork();
+    const label = k === "name" ? "节点设备名" : "在线状态";
+    const dirTxt = k === "name" ? (netSort.dir === 1 ? "A-Z 升序" : "Z-A 降序") : (netSort.dir === 1 ? "在线优先" : "离线优先");
+    toast(`已按 ${label}（${dirTxt}）排序`);
   })
 );
 
@@ -2401,14 +2454,7 @@ $("btnNetSave").addEventListener("click", async () => {
   s.centralNode = netCentralSS ? netCentralSS.getValue() : $("netCentral").value;
   s.punchPriority = +$("netPunch").value;
   s.mtu = +$("netMtu").value || 1420;
-  document.querySelectorAll("#netTable tbody tr").forEach((tr) => {
-    const name = tr.dataset.name;
-    const node = (s.Nodes || []).find((n) => n.name === name);
-    if (node) {
-      node.ip = tr.querySelector(".ip-input").value.trim();
-      node.resource = tr.querySelector(".res-input").value.trim();
-    }
-  });
+  syncNetInputs();
   const saveBtn = $("btnNetSave");
   saveBtn.disabled = true;
   saveBtn.textContent = "保存中…";
@@ -2521,8 +2567,9 @@ function renderMemApps() {
   // 排序列头箭头
   document.querySelectorAll("#memTable th.sortable").forEach((th) => {
     const arrow = th.querySelector(".sort-arrow");
-    if (arrow) arrow.textContent = memSort.key === th.dataset.sort ? (memSort.dir === 1 ? " ▲" : " ▼") : "";
-    th.classList.toggle("sorted", memSort.key === th.dataset.sort);
+    const isSorted = memSort.key === th.dataset.sort;
+    if (arrow) arrow.textContent = isSorted ? (memSort.dir === 1 ? " ▲" : " ▼") : " ⇅";
+    th.classList.toggle("sorted", isSorted);
   });
 
   tbody.innerHTML = list.map((a) => {
@@ -2568,6 +2615,9 @@ document.querySelectorAll("#memTable th.sortable").forEach((th) =>
     if (memSort.key === k) memSort.dir *= -1;
     else { memSort.key = k; memSort.dir = 1; }
     renderMemApps();
+    const label = k === "peer" ? "对端设备名" : k === "online" ? "对端在线状态" : "连接状态";
+    const dirTxt = k === "peer" ? (memSort.dir === 1 ? "A-Z 升序" : "Z-A 降序") : (memSort.dir === 1 ? "在线/活跃优先" : "离线/异常优先");
+    toast(`已按 ${label}（${dirTxt}）排序`);
   })
 );
 
