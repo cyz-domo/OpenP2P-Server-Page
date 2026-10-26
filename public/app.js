@@ -13,6 +13,7 @@ const state = {
   devices: [],
   latestVer: "",
   sdwan: null,
+  sdwanBase: null,    // 服务端原样配置快照，用于保存前算 diff
   tunnelByNode: {},   // node -> Apps[]
   memApps: [],        // 当前查看成员的组网隧道明细
   profile: null,      // 含 installToken
@@ -1147,6 +1148,7 @@ $("loginForm").addEventListener("submit", async (ev) => {
 function clearAccountSessionState() {
   state.devices = [];
   state.sdwan = null;
+  state.sdwanBase = null;
   state.profile = null;
   state.tunnelByNode = {};
   state.memByNode = {};
@@ -1378,6 +1380,7 @@ async function refreshAll(force = false) {
       toast("设备列表拉取失败: " + JSON.stringify(devs.data).slice(0, 120), "err");
     }
     state.sdwan = sdw.status === 200 && sdw.data.Nodes ? sdw.data : null;
+    state.sdwanBase = state.sdwan ? JSON.parse(JSON.stringify(state.sdwan)) : null;
     if (prof.status === 200 && prof.data.profile) state.profile = prof.data.profile;
     renderDevices();
     renderNetwork();
@@ -2485,12 +2488,18 @@ $("memberForm").addEventListener("submit", (ev) => {
   if (!picked.length) { $("memberDialog").close(); return; }
   syncNetInputs();
   const used = new Set((state.sdwan.Nodes || []).map((m) => m.ip).filter(Boolean));
+  let failed = 0;
   for (const name of picked) {
-    state.sdwan.Nodes.push({ name, ip: nextVirtualIP(used) });
+    const ip = nextVirtualIP(used);
+    if (!ip) { failed++; continue; }
+    state.sdwan.Nodes.push({ name, ip });
   }
   $("memberDialog").close();
   renderNetwork();
-  toast(`已添加 ${picked.length} 台设备（虚拟 IP 已自动分配），点击「保存整网配置」生效`);
+  const bytesAfter = jsonByteLen(buildNetBody(state.sdwan));
+  if (failed) toast(`已添加 ${picked.length - failed} 台，${failed} 台未能分配虚拟 IP（网关子网 2-253 已占满）`, "err");
+  else if (bytesAfter > NET_BODY_LIMIT) toast(`已添加 ${picked.length} 台，但整网报文 ${bytesAfter} 字节已超过官方 4096 上限，保存必被拒收——请先移除部分成员`, "err");
+  else toast(`已添加 ${picked.length} 台设备（虚拟 IP 已自动分配），点击「保存整网配置」生效`);
 });
 
 $("netTable").addEventListener("click", (ev) => {
@@ -2547,8 +2556,65 @@ document.querySelectorAll("#netTable th.sortable").forEach((th) =>
   })
 );
 
+function checkNetConflicts(s) {
+  const errs = [];
+  const gw = (s.gateway || "10.11.1.254/24").split("/");
+  const gwIp = (gw[0] || "").trim();
+  const prefix = (gw[1] || "24").trim();
+  const base = gwIp.split(".").slice(0, 3).join(".");
+  const ipOwner = new Map();
+  const names = new Set();
+  (s.Nodes || []).forEach((n, i) => {
+    const label = n.name || `第 ${i + 1} 行`;
+    if (!n.name) errs.push(`${label}：节点名为空`);
+    else if (names.has(n.name)) errs.push(`节点名重复：${n.name}`);
+    else names.add(n.name);
+    const ip = (n.ip || "").trim();
+    if (!ip) { errs.push(`${label}：虚拟 IP 为空`); return; }
+    const seg = ip.split(".");
+    if (seg.length !== 4 || seg.some((o) => !/^\d+$/.test(o) || +o > 255)) { errs.push(`${label}：虚拟 IP 非法（${ip}）`); return; }
+    if (prefix === "24" && seg.slice(0, 3).join(".") !== base) errs.push(`${label}：虚拟 IP ${ip} 不在网关子网 ${base}.0/24 内`);
+    if (ip === gwIp) errs.push(`${label}：虚拟 IP 与网关地址冲突（${gwIp}）`);
+    const prev = ipOwner.get(ip);
+    if (prev) errs.push(`虚拟 IP 冲突：${ip} 同时分配给「${prev}」和「${label}」`);
+    else ipOwner.set(ip, label);
+  });
+  return [...new Set(errs)];
+}
+
+function diffNetAgainstServer(s) {
+  const baseNodes = state.sdwanBase && state.sdwanBase.Nodes ? state.sdwanBase.Nodes : [];
+  const baseMap = new Map(baseNodes.map((n) => [n.name, n]));
+  const curMap = new Map((s.Nodes || []).map((n) => [n.name, n]));
+  const added = [], removed = [], vipChanged = [];
+  for (const [name, n] of curMap) {
+    const b = baseMap.get(name);
+    if (!b) added.push(name);
+    else if ((b.ip || "") !== (n.ip || "")) vipChanged.push(`${name} ${b.ip || "∅"}→${n.ip || "∅"}`);
+  }
+  for (const name of baseMap.keys()) if (!curMap.has(name)) removed.push(name);
+  return { added, removed, vipChanged };
+}
+
+/* 官方 sdwan/edit 请求体上限实测 4096 字节（超出直接 413，body 只有 "null"）。
+   空的 resource 每台白占 14 字节，必须丢掉才有额度装成员。 */
+const NET_BODY_LIMIT = 4096;
+
+function buildNetBody(s) {
+  const body = Object.assign({}, s);
+  body.Nodes = (s.Nodes || []).map((n) => {
+    const o = { name: n.name, ip: n.ip };
+    if (n.resource) o.resource = n.resource;
+    return o;
+  });
+  return body;
+}
+
+function jsonByteLen(obj) {
+  return new TextEncoder().encode(JSON.stringify(obj)).length;
+}
+
 $("btnNetSave").addEventListener("click", async () => {
-  if (!(await confirmDlg("保存虚拟网络", "将把整网配置（成员/虚拟 IP/子网代理 resource 变更）全量提交并下发到各成员，网络会短暂收敛。继续？"))) return;
   const s = state.sdwan;
   s.name = $("netName").value.trim();
   s.gateway = $("netGateway").value.trim();
@@ -2557,24 +2623,63 @@ $("btnNetSave").addEventListener("click", async () => {
   s.punchPriority = +$("netPunch").value;
   s.mtu = +$("netMtu").value || 1420;
   syncNetInputs();
+
+  const errs = checkNetConflicts(s);
+  if (errs.length) {
+    toast(`配置存在 ${errs.length} 处冲突，已阻止提交：` + errs.slice(0, 4).join("；"), "err");
+    return;
+  }
+
+  const d = diffNetAgainstServer(s);
+  const body = buildNetBody(s);
+  const bytes = jsonByteLen(body);
+  if (bytes > NET_BODY_LIMIT) {
+    toast(`报文 ${bytes} 字节，已超过官方 4096 字节上限（多 ${bytes - NET_BODY_LIMIT} 字节）。` +
+      `官方对超限请求只回 413 和 "null"，不会说明原因。请删减成员或缩短子网代理字段后再保存。`, "err");
+    return;
+  }
+
+  const parts = [];
+  if (d.added.length) parts.push(`新增成员 ${d.added.length}`);
+  if (d.removed.length) parts.push(`移除成员 ${d.removed.length}`);
+  if (d.vipChanged.length) parts.push(`改写虚拟 IP ${d.vipChanged.length}`);
+  if (!parts.length) parts.push("与服务端配置一致（仅重新下发）");
+  let msg = `共 ${(s.Nodes || []).length} 个成员｜${parts.join("、")}｜报文 ${bytes}/${NET_BODY_LIMIT} 字节。` +
+    `将全量提交并下发到各成员，网络会短暂收敛。`;
+  if (d.vipChanged.length) {
+    msg += ` 注意：本次会改动 ${d.vipChanged.length} 个成员的 VIP（${d.vipChanged.slice(0, 5).join("，")}${d.vipChanged.length > 5 ? " …" : ""}），` +
+      `这些成员与其他成员的既有连接会全部重建。`;
+  }
+  if (bytes > NET_BODY_LIMIT - 400) {
+    msg += ` 报文已逼近上限，再加成员大概率被官方拒收。`;
+  }
+  if (!(await confirmDlg("保存虚拟网络", msg))) return;
+
   const saveBtn = $("btnNetSave");
   saveBtn.disabled = true;
   saveBtn.textContent = "保存中…";
+  const t0 = Date.now();
   try {
-    const rsp = await pxp("/api/v1/sdwan/edit", { method: "POST", body: s });
-    if (rsp.status === 200) {
-      // 回读服务端配置，确认子网代理等变更真实生效
+    const rsp = await pxp("/api/v1/sdwan/edit", { method: "POST", body, timeout: 90000 });
+    const ms = Date.now() - t0;
+    if (rsp.status === 200 && rsp.data && rsp.data.error === 0) {
       const verify = await pxp("/api/v1/sdwans");
       const saved = verify.status === 200 && verify.data.Nodes ? verify.data : null;
-      const savedRes = saved ? saved.Nodes.map((n) => `${n.name}:${n.resource || "∅"}`).join(" ") : "";
-      const localRes = s.Nodes.map((n) => `${n.name}:${n.resource || "∅"}`).join(" ");
-      const synced = saved && savedRes === localRes;
-      toast(synced
-        ? "✓ 已保存：子网代理配置已生效并下发"
-        : "已提交保存（服务端确认回执中，如未生效请稍后点「↻ 刷新」核对）", "ok");
-      if (saved) { state.sdwan = saved; renderNetwork(); }
+      if (saved) {
+        state.sdwan = saved;
+        state.sdwanBase = JSON.parse(JSON.stringify(saved));
+        renderNetwork();
+      }
+      const pending = saved ? saved.Nodes.length !== s.Nodes.length : true;
+      toast(pending
+        ? `已提交（${ms}ms），服务端成员数 ${saved ? saved.Nodes.length : "?"} 与本地 ${s.Nodes.length} 不一致，请稍后「↻ 刷新」核对`
+        : `✓ 已保存并下发（${ms}ms）`, "ok");
     } else {
-      toast("保存失败: " + JSON.stringify(rsp.data).slice(0, 160), "err");
+      const why = rsp.data && (rsp.data.detail || rsp.data.raw) ? String(rsp.data.detail || rsp.data.raw).slice(0, 120) : "";
+      const hint = rsp.status === 413 ? "报文超出官方 4096 字节上限，需减少成员或子网代理字段"
+        : rsp.status === 500 ? "官方处理该配置时自身报错（500），配置未生效"
+        : why || "上游未返回任何错误说明；配置未变更，可点「↻ 刷新」确认";
+      toast(`保存失败 HTTP ${rsp.status}（${ms}ms）：${hint}`, "err");
     }
   } finally {
     saveBtn.disabled = false;
