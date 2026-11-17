@@ -4,12 +4,12 @@
 职责：
 1. 托管 ./public 下的静态前端
 2. 把 /pxp/* 请求反向代理到 OpenP2P 官方控制台，自动附带 Authorization token
-3. token 过期时用保存的账号密码自动重登（可选）
+3. 仅持久化 Session 与上游 token；不保存账号密码
 
 用法：
-    python3 server.py --token <JWT> [--upstream https://console.openpxp.com] [--port 8377]
-    python3 server.py --user goodnight --password 'xxx'   # 无 token 时自动登录
-配置持久化在同目录 config.json。
+    python3 server.py [--upstream https://console.openpxp.com] [--port 8377]
+    PANEL_KEY='你的访问口令' python3 server.py --host 0.0.0.0
+配置持久化在同目录 config.json。自托管模式不支持通行密钥，请使用密码或 token 登录。
 """
 
 import argparse
@@ -65,7 +65,7 @@ _rate_limits: dict = {}     # ip -> [count, window_start]
 
 # ---------- 登录防爆破 ----------
 CAPTCHA_TTL = 300        # 验证码 5 分钟有效
-CAPTCHA_LEN = 4
+CAPTCHA_LEN = 6
 LOCK_THRESHOLD = 5       # 连续失败 5 次
 LOCK_WINDOW = 900        # 锁定 15 分钟
 _captcha_lock = threading.Lock()
@@ -97,6 +97,23 @@ def is_private_host(hostname: str) -> bool:
         )
     except ValueError:
         return False
+
+
+def validate_upstream_url(url_str: str) -> tuple[bool, str]:
+    """校验上游控制台地址：仅允许 HTTPS 根地址，禁止内网/元数据与内嵌凭据。"""
+    try:
+        parsed = urlparse(url_str)
+    except ValueError:
+        return False, "上游地址格式不正确"
+    if parsed.scheme != "https":
+        return False, "上游地址必须使用 HTTPS 协议"
+    if parsed.username or parsed.password:
+        return False, "上游地址不能包含用户名或密码"
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        return False, "上游地址只能是站点根地址（不能带路径、参数或锚点）"
+    if is_private_host(parsed.hostname or ""):
+        return False, "禁止使用私有内网或云平台元数据地址作为上游"
+    return True, parsed.geturl().rstrip("/")
 
 
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -172,24 +189,23 @@ def tighten_config_perm() -> None:
             pass
 
 
-# 密码在本地是"可还原"存储（面板要拿明文向官方重登），无法做单向哈希。
-# 采用混淆存储（XOR+base64）：防直接 grep/肉眼读取，不是加密——拿到本机即可破解。
-_OBF_KEY = "openp2p-panel-local"
-
-
-def obf_encode(text: str) -> str:
-    data = text.encode()
-    key = _OBF_KEY.encode()
-    return base64.b64encode(bytes(b ^ key[i % len(key)] for i, b in enumerate(data))).decode()
-
-
-def obf_decode(text: str) -> str:
-    try:
-        data = base64.b64decode(text)
-        key = _OBF_KEY.encode()
-        return bytes(b ^ key[i % len(key)] for i, b in enumerate(data)).decode()
-    except Exception:
-        return text  # 兼容旧明文
+def scrub_legacy_secrets(cfg: dict) -> None:
+    """清除旧版本落盘的明文/混淆密码与通行密钥记录（一次性迁移）。"""
+    changed = False
+    for key in ("password", "passkeys"):
+        if key in cfg:
+            cfg.pop(key, None)
+            changed = True
+    pools = [cfg.get("accounts") or []]
+    pools += [s.get("accounts") or [] for s in (cfg.get("sessions") or {}).values() if isinstance(s, dict)]
+    for pool in pools:
+        for acc in pool:
+            if isinstance(acc, dict) and "password" in acc:
+                acc.pop("password", None)
+                changed = True
+    if changed:
+        save_config(cfg)
+        print("[SECURITY] 已清除 config.json 中旧版本保存的密码与通行密钥数据")
 
 
 # ---------- 验证码与失败锁定 ----------
@@ -201,7 +217,7 @@ def _captcha_sweep() -> None:
 
 
 def new_captcha(theme: str = "dark") -> tuple[str, str]:
-    """生成 4 位数字验证码，返回 (captcha_id, svg)。单次有效。"""
+    """生成 6 位数字验证码，返回 (captcha_id, svg)。单次有效。"""
     code = "".join(secrets.choice("0123456789") for _ in range(CAPTCHA_LEN))
     cid = secrets.token_urlsafe(16)
     with _captcha_lock:
@@ -289,25 +305,10 @@ def clear_fails(ip: str) -> None:
         _failures.pop(ip, None)
 
 
-def migrate_accounts(cfg: dict) -> None:
-    """旧单账户 config（顶层 user/token/password）→ accounts 列表。幂等。"""
-    accounts = cfg.get("accounts")
-    if accounts:
-        return
-    user = cfg.get("user", "")
-    if not user:
-        cfg["accounts"] = []
-        return
-    cfg["accounts"] = [{
-        "user": user,
-        "token": cfg.get("token", ""),
-        "password": cfg.get("password", ""),
-    }]
-    cfg["activeUser"] = user
-
-
 # ---------- Session 管理与多用户隔离 ----------
 SESSION_COOKIE_NAME = "openp2p_session"
+PANEL_COOKIE_NAME = "openp2p_panel"
+PANEL_COOKIE_TTL = 12 * 3600
 SESSION_TTL = 7 * 86400  # 会话 7 天有效
 
 
@@ -330,6 +331,9 @@ class SessionManager:
             now = time.time()
             for sid, s in raw.items():
                 if isinstance(s, dict) and s.get("exp", 0) > now:
+                    for acc in s.get("accounts", []):
+                        if isinstance(acc, dict):
+                            acc.pop("password", None)
                     self.sessions[sid] = s
 
     def _save(self):
@@ -353,7 +357,7 @@ class SessionManager:
             s["last_seen"] = time.time()
             return s
 
-    def create_session(self, user: str, token: str, password: str | None = None) -> str:
+    def create_session(self, user: str, token: str, upstream: str | None = None) -> str:
         sid = secrets.token_urlsafe(32)
         now = time.time()
         with self.lock:
@@ -363,13 +367,8 @@ class SessionManager:
                 "last_seen": now,
                 "exp": now + SESSION_TTL,
                 "activeUser": user,
-                "accounts": [
-                    {
-                        "user": user,
-                        "token": token,
-                        "password": obf_encode(password) if password else "",
-                    }
-                ],
+                "upstream": upstream or self.cfg["upstream"],
+                "accounts": [{"user": user, "token": token}],
             }
             self.sessions[sid] = s
             self._save()
@@ -383,7 +382,7 @@ class SessionManager:
                 self.sessions.pop(sid, None)
                 self._save()
 
-    def add_or_update_account(self, sid: str, user: str, token: str, password: str | None = None):
+    def add_or_update_account(self, sid: str, user: str, token: str, upstream: str | None = None):
         with self.lock:
             s = self.sessions.get(sid)
             if not s:
@@ -394,9 +393,9 @@ class SessionManager:
                 acc = {"user": user}
                 pool.append(acc)
             acc["token"] = token
-            if password is not None:
-                acc["password"] = obf_encode(password)
             s["activeUser"] = user
+            if upstream:
+                s["upstream"] = upstream
             s["exp"] = time.time() + SESSION_TTL
             self._save()
 
@@ -462,11 +461,11 @@ class Upstream:
         except Exception:
             return 0
 
-    def login(self, user: str, password: str) -> dict:
+    def login(self, user: str, password: str, upstream: str | None = None) -> dict:
         """登录官方控制台并返回结果与 token。"""
         body = json.dumps({"user": user, "password": password}).encode()
         req = urllib.request.Request(
-            self.cfg["upstream"] + "/api/v1/user/login",
+            (upstream or self.cfg["upstream"]) + "/api/v1/user/login",
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -479,13 +478,13 @@ class Upstream:
         except Exception as e:
             return {"error": -1, "detail": _sanitize_error(str(e))}
 
-    def login_with_token(self, token: str) -> dict:
+    def login_with_token(self, token: str, upstream: str | None = None) -> dict:
         """用现成 JWT 登录：向官方验证 token 有效性。"""
         token = token.strip()
         if not token.count(".") == 2:
             return {"error": -1, "detail": "token 格式不正确（应为 JWT）"}
         req = urllib.request.Request(
-            self.cfg["upstream"] + "/api/v1/user/profile",
+            (upstream or self.cfg["upstream"]) + "/api/v1/user/profile",
             data=b"{}",
             headers={"Authorization": token, "Content-Type": "application/json"},
             method="POST",
@@ -503,30 +502,24 @@ class Upstream:
         return {"error": 0, "token": token, "user": user}
 
     def ensure_token(self, session: dict) -> str:
-        """按 session 的激活账户获取有效 token；若过期且存有密码则自动重登。"""
+        """返回 session 激活账户的 token；不保存密码，过期后需用户重新登录。"""
         pool = session.get("accounts", [])
         user = session.get("activeUser", "")
         acc = next((a for a in pool if a["user"] == user), None)
         if not acc:
             return ""
         token = acc.get("token", "")
-        if token and self.jwt_exp(token) > time.time() + 60:
-            return token
-        # token 缺失/过期，尝试用该账户保存的密码重登
-        pwd_obf = acc.get("password", "")
-        if pwd_obf:
-            rsp = self.login(user, obf_decode(pwd_obf))
-            if rsp.get("error") == 0 and rsp.get("token"):
-                new_tok = rsp["token"]
-                self.session_mgr.add_or_update_account(session["sid"], user, new_tok, obf_decode(pwd_obf))
-                return new_tok
+        exp = self.jwt_exp(token)
+        if token and exp and exp <= time.time() + 30:
+            return ""
         return token
 
-    def request_with_token(self, token: str, method: str, path: str, body: bytes | None, content_type: str):
+    def request_with_token(self, token: str, method: str, path: str, body: bytes | None, content_type: str,
+                           upstream: str | None = None):
         headers = {"Authorization": token}
         if body:
             headers["Content-Type"] = content_type or "application/json"
-        req = urllib.request.Request(self.cfg["upstream"] + path, data=body, headers=headers, method=method)
+        req = urllib.request.Request((upstream or self.cfg["upstream"]) + path, data=body, headers=headers, method=method)
         try:
             with self.opener.open(req, timeout=PUSH_TIMEOUT) as rsp:
                 return rsp.status, rsp.read(), dict(rsp.headers)
@@ -550,38 +543,65 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
 
+    def _cookies(self):
+        import http.cookies
+
+        c = http.cookies.SimpleCookie()
+        try:
+            c.load(self.headers.get("Cookie", ""))
+        except Exception:
+            pass
+        return c
+
+    def _panel_cookie_value(self) -> str:
+        return hmac.new(PANEL_KEY.encode(), b"openp2p-panel-cookie-v1", hashlib.sha256).hexdigest()
+
     def _authorized(self) -> bool:
         if not PANEL_KEY:
             return True
-        # 静态首页放行（登录页需要先加载），其余一律验密钥
-        if self.path == "/" or self.path.startswith("/index") or self.path.startswith("/app."):
+        path = urlparse(self.path).path
+        if path.startswith("/api/panel-auth"):
             return True
-        return self.headers.get("X-Panel-Key") == PANEL_KEY
+        # 静态资源不包含敏感数据，放行以便登录页正常加载样式与脚本
+        if not (path.startswith("/api/") or path.startswith("/pxp/")):
+            return True
+        key = self.headers.get("X-Panel-Key", "")
+        if key and hmac.compare_digest(key, PANEL_KEY):
+            return True
+        cookie = self._cookies().get(PANEL_COOKIE_NAME)
+        return bool(cookie) and hmac.compare_digest(cookie.value, self._panel_cookie_value())
+
+    def _cross_site(self) -> bool:
+        """拒绝跨站写请求（Cookie 为 SameSite=Lax，此处做纵深防御）。"""
+        site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+        if site and site not in ("same-origin", "none"):
+            return True
+        origin = self.headers.get("Origin")
+        if not origin:
+            return False
+        return urlparse(origin).netloc.lower() != (self.headers.get("Host") or "").lower()
 
     def _get_session_id(self) -> str:
-        # 1. 检查 Cookie 头
-        cookie_header = self.headers.get("Cookie", "")
-        if cookie_header:
-            import http.cookies
-
-            c = http.cookies.SimpleCookie()
-            try:
-                c.load(cookie_header)
-                if SESSION_COOKIE_NAME in c:
-                    return c[SESSION_COOKIE_NAME].value
-            except Exception:
-                pass
-        # 2. 检查 X-Session-Id 请求头
+        cookie = self._cookies().get(SESSION_COOKIE_NAME)
+        if cookie:
+            return cookie.value
+        # 兼容 API 客户端：X-Session-Id 或 Bearer <sid>
         sid = self.headers.get("X-Session-Id")
         if sid:
             return sid.strip()
-        # 3. 检查 Authorization 头（Bearer <sid>）
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             return auth[7:].strip()
         return ""
 
     # ---------- 响应工具 ----------
+    def _is_https(self) -> bool:
+        return self.headers.get("X-Forwarded-Proto") == "https" or getattr(self.server, "is_ssl", False)
+
+    def _session_cookie(self, sid: str, max_age: int = SESSION_TTL) -> str:
+        secure = "; Secure" if self._is_https() else ""
+        return f"{SESSION_COOKIE_NAME}={sid}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}"
+
     def _send(
         self,
         code: int,
@@ -601,7 +621,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-XSS-Protection", "1; mode=block")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Content-Security-Policy", _CSP_POLICY)
-        if self.headers.get("X-Forwarded-Proto") == "https" or getattr(self.server, "is_ssl", False):
+        if self._is_https():
             self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         if extra_headers:
             for k, v in extra_headers:
@@ -636,6 +656,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json({"error": 401, "detail": "需要访问口令"}, 401)
             return
+        if self._cross_site():
+            self._json({"error": 403, "detail": "跨站请求已被拒绝"}, 403)
+            return
         if self._is_proxy():
             self._proxy("POST")
         elif self.path.startswith("/api/"):
@@ -646,6 +669,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         if not self._authorized():
             self._json({"error": 401, "detail": "需要访问口令"}, 401)
+            return
+        if self._cross_site():
+            self._json({"error": 403, "detail": "跨站请求已被拒绝"}, 403)
             return
         if self._is_proxy():
             self._proxy("PUT")
@@ -705,26 +731,56 @@ class Handler(BaseHTTPRequestHandler):
 
         sid = self._get_session_id()
         session = _session_mgr.get_session(sid)
+        active_upstream = _upstream.cfg["upstream"]
+        if session and session.get("upstream"):
+            ok, normalized = validate_upstream_url(session["upstream"])
+            if ok:
+                active_upstream = normalized
 
-        if req_path == "/api/state":
+        if req_path == "/api/panel-auth" and method == "POST":
+            if not PANEL_KEY:
+                self._json({"error": 0})
+                return
+            ip = self._client_ip()
+            if not _check_rate_limit(ip, 10) or is_locked(ip):
+                self._json({"error": 429, "detail": "口令尝试次数过多，请稍后再试"}, 429)
+                return
+            try:
+                data = json.loads(raw.decode() or "{}")
+            except Exception:
+                self._json({"error": -1, "detail": "请求格式错误"}, 400)
+                return
+            key = str(data.get("key") or "")
+            if not key or not hmac.compare_digest(key, PANEL_KEY):
+                record_fail(ip)
+                self._json({"error": 401, "detail": "访问口令错误"}, 401)
+                return
+            clear_fails(ip)
+            cookie = (
+                f"{PANEL_COOKIE_NAME}={self._panel_cookie_value()}; Path=/; "
+                f"Max-Age={PANEL_COOKIE_TTL}; HttpOnly; SameSite=Lax"
+                + ("; Secure" if self._is_https() else "")
+            )
+            self._json({"error": 0}, extra_headers=[("Set-Cookie", cookie)])
+        elif req_path == "/api/state":
             if session and session.get("activeUser"):
                 pool = session.get("accounts", [])
                 user = session.get("activeUser", "")
                 acc = next((a for a in pool if a["user"] == user), None)
                 token = acc.get("token", "") if acc else ""
                 self._json({
-                    "upstream": _upstream.cfg["upstream"],
+                    "upstream": active_upstream,
                     "user": user,
                     "hasToken": bool(token),
                     "tokenExp": Upstream.jwt_exp(token) if token else 0,
                     "hasCustomSecret": True,
                     "insecureSsl": _upstream.insecure_ssl,
+                    "passkeysSupported": False,
                     "accounts": [
                         {
                             "user": a["user"],
                             "hasToken": bool(a.get("token")),
                             "tokenExp": Upstream.jwt_exp(a.get("token", "")),
-                            "hasPassword": bool(a.get("password")),
                             "active": a["user"] == user,
                         }
                         for a in pool
@@ -733,18 +789,18 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 pool = session.get("accounts", []) if session else []
                 self._json({
-                    "upstream": _upstream.cfg["upstream"],
+                    "upstream": active_upstream,
                     "user": "",
                     "hasToken": False,
                     "tokenExp": 0,
                     "hasCustomSecret": True,
                     "insecureSsl": _upstream.insecure_ssl,
+                    "passkeysSupported": False,
                     "accounts": [
                         {
                             "user": a["user"],
                             "hasToken": bool(a.get("token")),
                             "tokenExp": Upstream.jwt_exp(a.get("token", "")),
-                            "hasPassword": bool(a.get("password")),
                             "active": False,
                         }
                         for a in pool
@@ -788,113 +844,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": -1, "detail": "请求体不是合法 JSON"})
                 return
 
-            new_up = (data.get("upstream") or "").strip().rstrip("/")
-            if not new_up.startswith("http://") and not new_up.startswith("https://"):
-                self._json({"error": -1, "detail": "官方控制台地址必须以 http:// 或 https:// 开头"})
+            ok, result = validate_upstream_url((data.get("upstream") or "").strip())
+            if not ok:
+                self._json({"error": -1, "detail": result})
                 return
-            parsed_up = urlparse(new_up)
-            host = (parsed_up.hostname or "").lower()
-            if is_private_host(host):
-                self._json({"error": -1, "detail": f"禁止配置私有内网或云元数据地址作为上游: {host}"})
-                return
-            _upstream.cfg["upstream"] = new_up
-            save_config(_upstream.cfg)
-            print(f"[panel] 官方代理上游地址已更新为: {new_up}")
-            self._json({"error": 0, "upstream": new_up})
-        elif req_path == "/api/passkey/challenge" and method in ("GET", "POST"):
-            challenge_bytes = secrets.token_bytes(32)
-            challenge_b64 = base64.urlsafe_b64encode(challenge_bytes).decode().rstrip("=")
-            self._json({"error": 0, "challenge": challenge_b64})
-        elif req_path == "/api/passkey/bind" and method == "POST":
-            if not session or not session.get("activeUser"):
-                self._json({"error": 401, "detail": "请先登录后再绑定通行密钥"}, 401)
-                return
-            try:
-                data = json.loads(raw.decode() or "{}")
-            except Exception:
-                self._json({"error": -1, "detail": "请求格式错误"}, 400)
-                return
-            cred_id = (data.get("credentialId") or "").strip()
-            dev_name = (data.get("deviceName") or "当前设备").strip()
-            if not cred_id:
-                self._json({"error": -1, "detail": "缺少凭据标识"}, 400)
-                return
-            pool = session.get("accounts", [])
-            user = session.get("activeUser", "")
-            acc = next((a for a in pool if a["user"] == user), None)
-            if not acc:
-                self._json({"error": 401, "detail": "未找到当前账户凭据"}, 401)
-                return
-            payload = {
-                "credentialId": cred_id,
-                "user": acc["user"],
-                "token": acc.get("token", ""),
-                "password": acc.get("password", ""),
-                "upstream": _upstream.cfg["upstream"],
-                "deviceName": dev_name,
-                "createdAt": int(time.time() * 1000),
-            }
-            if "passkeys" not in _upstream.cfg:
-                _upstream.cfg["passkeys"] = {}
-            _upstream.cfg["passkeys"][cred_id] = payload
-            save_config(_upstream.cfg)
-
-            cipher = obf_encode(json.dumps(payload))
-            self._json({
-                "error": 0,
-                "credentialId": cred_id,
-                "passkeyCipher": cipher,
-                "user": acc["user"],
-                "deviceName": dev_name,
-                "createdAt": payload["createdAt"],
-            })
-        elif req_path == "/api/passkey/login" and method == "POST":
-            try:
-                data = json.loads(raw.decode() or "{}")
-            except Exception:
-                self._json({"error": -1, "detail": "请求格式错误"}, 400)
-                return
-            cred_id = (data.get("credentialId") or "").strip()
-            cipher = (data.get("passkeyCipher") or "").strip()
-            if not cred_id:
-                self._json({"error": -1, "detail": "缺少凭据标识"}, 400)
-                return
-            payload = None
-            if cipher:
-                try:
-                    decrypted = obf_decode(cipher)
-                    payload = json.loads(decrypted)
-                except Exception:
-                    pass
-            if not payload and cred_id in _upstream.cfg.get("passkeys", {}):
-                payload = _upstream.cfg["passkeys"][cred_id]
-            if not payload:
-                self._json({"error": 401, "detail": "通行密钥凭据已失效或损坏，请重新绑定"}, 401)
-                return
-            if payload.get("credentialId") != cred_id:
-                self._json({"error": 401, "detail": "凭据指纹不匹配"}, 401)
-                return
-            user = payload.get("user")
-            token = payload.get("token")
-            if not session:
-                sid = _session_mgr.new_session()
-                session = _session_mgr.get_session(sid)
+            _upstream.cfg["upstream"] = result
+            if session:
+                with _session_mgr.lock:
+                    session["upstream"] = result
+                    _session_mgr._save()
             else:
-                sid = self._get_session_id()
-            _session_mgr.add_account(sid, user, token, payload.get("password", ""))
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Set-Cookie", f"openp2p_session={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}")
-            self.wfile.write(json.dumps({
-                "error": 0,
-                "user": user,
-                "token": token,
-                "sessionId": sid,
-                "credentialId": cred_id,
-                "passkeyCipher": cipher,
-                "deviceName": payload.get("deviceName", "当前设备"),
-                "createdAt": payload.get("createdAt", int(time.time() * 1000))
-            }).encode())
+                save_config(_upstream.cfg)
+            print(f"[panel] 官方代理上游地址已更新为: {result}")
+            self._json({"error": 0, "upstream": result})
+        elif req_path.startswith("/api/passkey/"):
+            # 自托管实现没有 WebAuthn 验签依赖；开放这些接口会形成登录绕过。
+            self._json({
+                "error": 501,
+                "detail": "自托管模式暂不支持通行密钥，请使用密码或 token 登录",
+            }, 501)
         elif req_path == "/api/login" and method == "POST":
             try:
                 data = json.loads(raw.decode() or "{}")
@@ -918,23 +886,24 @@ class Handler(BaseHTTPRequestHandler):
             if not user or not password:
                 self._json({"error": -1, "detail": "需要用户名和密码"})
                 return
+            login_upstream = active_upstream
             if data.get("upstream"):
-                new_up = data["upstream"].strip().rstrip("/")
-                if new_up.startswith("http://") or new_up.startswith("https://"):
-                    _upstream.cfg["upstream"] = new_up
-                    save_config(_upstream.cfg)
-            rsp = _upstream.login(user, password)
+                ok, result = validate_upstream_url(str(data["upstream"]).strip())
+                if not ok:
+                    self._json({"error": -1, "detail": result})
+                    return
+                login_upstream = result
+            rsp = _upstream.login(user, password, login_upstream)
             if rsp.get("error") == 0 and rsp.get("token"):
                 clear_fails(ip)
                 tok = rsp["token"]
                 if session:
-                    _session_mgr.add_or_update_account(sid, user, tok, password if data.get("remember") else None)
+                    _session_mgr.add_or_update_account(sid, user, tok, login_upstream)
                 else:
-                    sid = _session_mgr.create_session(user, tok, password if data.get("remember") else None)
-                cookie = f"{SESSION_COOKIE_NAME}={sid}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax"
+                    sid = _session_mgr.create_session(user, tok, login_upstream)
                 self._json(
                     {"error": 0, "sessionId": sid, "user": user, "token": tok},
-                    extra_headers=[("Set-Cookie", cookie)],
+                    extra_headers=[("Set-Cookie", self._session_cookie(sid))],
                 )
             else:
                 record_fail(ip)
@@ -960,24 +929,25 @@ class Handler(BaseHTTPRequestHandler):
                 left = LOCK_THRESHOLD - _failures.get(ip, [0, 0])[0]
                 self._json({"error": -1, "detail": f"验证码错误（剩余 {max(left,0)} 次尝试机会）", "captchaFailed": True})
                 return
+            login_upstream = active_upstream
             if data.get("upstream"):
-                new_up = data["upstream"].strip().rstrip("/")
-                if new_up.startswith("http://") or new_up.startswith("https://"):
-                    _upstream.cfg["upstream"] = new_up
-                    save_config(_upstream.cfg)
-            rsp = _upstream.login_with_token(data.get("token") or "")
+                ok, result = validate_upstream_url(str(data["upstream"]).strip())
+                if not ok:
+                    self._json({"error": -1, "detail": result})
+                    return
+                login_upstream = result
+            rsp = _upstream.login_with_token(data.get("token") or "", login_upstream)
             if rsp.get("error") == 0 and rsp.get("token"):
                 clear_fails(ip)
                 tok = rsp["token"]
                 user = rsp.get("user") or Upstream.jwt_user(tok)
                 if session:
-                    _session_mgr.add_or_update_account(sid, user, tok)
+                    _session_mgr.add_or_update_account(sid, user, tok, login_upstream)
                 else:
-                    sid = _session_mgr.create_session(user, tok)
-                cookie = f"{SESSION_COOKIE_NAME}={sid}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax"
+                    sid = _session_mgr.create_session(user, tok, login_upstream)
                 self._json(
                     {"error": 0, "sessionId": sid, "user": user, "token": tok},
-                    extra_headers=[("Set-Cookie", cookie)],
+                    extra_headers=[("Set-Cookie", self._session_cookie(sid))],
                 )
             else:
                 record_fail(ip)
@@ -994,8 +964,10 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("all"):
                 if sid:
                     _session_mgr.delete_session(sid)
-                cookie = f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
-                self._json({"ok": True}, extra_headers=[("Set-Cookie", cookie)])
+                self._json(
+                    {"ok": True},
+                    extra_headers=[("Set-Cookie", self._session_cookie("", 0))],
+                )
             else:
                 if session:
                     with _session_mgr.lock:
@@ -1036,7 +1008,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": 401, "detail": "未获取到有效凭据，请重新登录"}, 401)
             return
 
-        code, body, headers = _upstream.request_with_token(token, method, path, raw, self.headers.get("Content-Type"))
+        upstream = _upstream.cfg["upstream"]
+        if session.get("upstream"):
+            ok, normalized = validate_upstream_url(session["upstream"])
+            if ok:
+                upstream = normalized
+
+        code, body, headers = _upstream.request_with_token(
+            token, method, path, raw, self.headers.get("Content-Type"), upstream
+        )
         ctype = headers.get("Content-Type", "application/json")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -1055,21 +1035,25 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="监听地址，默认仅本机；对外提供请加 --auth")
     parser.add_argument("--port", type=int, default=8377)
     parser.add_argument("--auth", default=None, help="访问口令：设置后所有 API 需带 X-Panel-Key 头")
-    parser.add_argument("--upstream", default=None, help="官方控制台地址")
-    parser.add_argument("--token", default=None, help="已登录的 JWT（可选）")
-    parser.add_argument("--user", default=None)
-    parser.add_argument("--password", default=None)
-    parser.add_argument("--no-save-password", action="store_true", help="不把密码写入 config.json")
+    parser.add_argument("--upstream", default=None, help="官方控制台地址（必须为 HTTPS 根地址）")
     parser.add_argument("--insecure-ssl", action="store_true", help="跳过上游 SSL/TLS 证书校验（不推荐，仅限自签名调试）")
     args = parser.parse_args()
 
     global PANEL_KEY
-    PANEL_KEY = args.auth or ""
+    PANEL_KEY = args.auth or os.environ.get("PANEL_KEY", "")
 
     cfg = load_config()
     cfg.setdefault("upstream", DEFAULT_UPSTREAM)
+    scrub_legacy_secrets(cfg)
     if args.upstream:
-        cfg["upstream"] = args.upstream
+        ok, result = validate_upstream_url(args.upstream)
+        if not ok:
+            parser.error(f"--upstream 无效：{result}")
+        cfg["upstream"] = result
+    ok, result = validate_upstream_url(cfg.get("upstream") or "")
+    if not ok:
+        print(f"[SECURITY] 上游配置无效（{result}），已回退到 {DEFAULT_UPSTREAM}")
+        cfg["upstream"] = DEFAULT_UPSTREAM
     save_config(cfg)
 
     _session_mgr = SessionManager(cfg)
